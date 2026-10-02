@@ -64,7 +64,8 @@ class CodexSession {
       cwd: this.cwd,
       model: this.model ?? null,
       ephemeral: false,
-      sandbox: "read-only",
+      approvalPolicy: "never",
+      sandbox: this.mode === "task" ? "workspace-write" : "read-only",
       developerInstructions,
       threadSource: "cli"
     });
@@ -81,6 +82,11 @@ class CodexSession {
     return this.run(`${target}\n${prompt}\nDo not modify files. Ask Claude for clarification when needed.`, { model, effort });
   }
 
+  async task(prompt, options = {}) {
+    if (this.mode !== "task") throw new Error("codex_task requires a task session");
+    return this.run(`${prompt}\nMake the requested changes in the repository, then report what changed and any checks you ran. Ask Claude for clarification when needed.`, options);
+  }
+
   async run(prompt, { model, effort } = {}) {
     if (this.active) throw new Error("This Codex session already has an active turn");
     this.validateModelOptions(model ?? this.model, effort ?? this.effort);
@@ -95,7 +101,7 @@ class CodexSession {
         model: model ?? this.model ?? null,
         effort: effort ?? this.effort ?? null,
         cwd: this.cwd,
-        sandboxPolicy: { type: "readOnly" }
+        sandboxPolicy: this.mode === "task" ? { type: "workspaceWrite", writableRoots: [this.cwd] } : { type: "readOnly" }
       });
       this.active.turnId = started.turn?.id ?? null;
       const result = await resultPromise;
@@ -128,7 +134,7 @@ class CodexSession {
       input: [{ type: "text", text: message }]
     });
     const result = await this.waitForActiveTurn();
-    this.active = null;
+    if (result.status !== "question") this.active = null;
     return { ...result, session_id: this.sessionId };
   }
 
@@ -199,7 +205,7 @@ class CodexSession {
     const selected = model ? this.modelCatalog.find((entry) => entry.id === model || entry.model === model) : null;
     if (model && !selected) throw new Error(`Unknown Codex model: ${model}. Use codex_models to list available models.`);
     if (!effort) return;
-    const target = selected ?? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model);
+    const target = selected ?? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model || entry.isDefault);
     const efforts = target?.supportedReasoningEfforts?.map((entry) => entry.reasoningEffort) ?? [];
     if (efforts.length && !efforts.includes(effort)) throw new Error(`Unsupported reasoning effort "${effort}" for ${model ?? this.model}; supported: ${efforts.join(", ")}`);
   }
@@ -209,6 +215,7 @@ class CodexSession {
       session_id: this.sessionId,
       thread_id: this.threadId,
       cwd: this.cwd,
+      mode: this.mode,
       active: Boolean(this.active),
       pending_question: this.pendingQuestion
     };

@@ -18,6 +18,7 @@ test("MCP server advertises the bidirectional Codex tools", async () => {
   const listing = JSON.parse(lines[1]);
   assert.deepEqual(listing.result.tools.map((tool) => tool.name), [
     "codex_ask",
+    "codex_task",
     "codex_review",
     "codex_answer",
     "codex_steer",

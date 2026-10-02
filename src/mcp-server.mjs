@@ -21,6 +21,21 @@ const tools = [
     }
   },
   {
+    name: "codex_task",
+    description: "Ask Codex to make repository changes. Codex can pause for clarification before continuing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        session_id: { type: "string" },
+        cwd: { type: "string" },
+        model: { type: "string" },
+        effort: { type: "string" }
+      },
+      required: ["prompt"]
+    }
+  },
+  {
     name: "codex_review",
     description: "Run an interactive read-only Codex review. Codex can ask Claude clarification questions before returning findings.",
     inputSchema: {
@@ -76,6 +91,10 @@ async function callTool(name, args = {}) {
   if (name === "codex_ask") {
     const session = await bridge.session(args);
     return session.ask(args.prompt, args);
+  }
+  if (name === "codex_task") {
+    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ ...args, mode: "task" });
+    return session.task(args.prompt, args);
   }
   if (name === "codex_review") {
     const session = await bridge.session({ ...args, mode: "review" });
