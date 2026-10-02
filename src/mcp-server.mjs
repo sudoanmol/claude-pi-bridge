@@ -54,6 +54,14 @@ const tools = [
     }
   },
   {
+    name: "codex_models",
+    description: "List Codex models and the reasoning efforts each model supports.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" }, cwd: { type: "string" } }
+    }
+  },
+  {
     name: "codex_status",
     description: "Inspect a Codex bridge session and any pending clarification question.",
     inputSchema: {
@@ -75,6 +83,10 @@ async function callTool(name, args = {}) {
   }
   if (name === "codex_answer") return bridge.get(args.session_id).answer(args.question_id, args.answer);
   if (name === "codex_steer") return bridge.get(args.session_id).steer(args.message);
+  if (name === "codex_models") {
+    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ cwd: args.cwd });
+    return { session_id: session.sessionId, models: session.models() };
+  }
   if (name === "codex_status") return bridge.get(args.session_id).status();
   throw new Error(`Unknown tool: ${name}`);
 }

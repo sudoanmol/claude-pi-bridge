@@ -2,17 +2,19 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 
 export class AppServerClient {
-  constructor({ cwd, onServerRequest, onNotification } = {}) {
+  constructor({ cwd, onServerRequest, onNotification, onFailure, command = process.env.CODEX_BIN ?? "codex" } = {}) {
     this.cwd = cwd;
     this.onServerRequest = onServerRequest;
     this.onNotification = onNotification;
+    this.onFailure = onFailure;
+    this.command = command;
     this.nextId = 1;
     this.pending = new Map();
     this.closed = false;
   }
 
   async start() {
-    this.process = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    this.process = spawn(this.command, ["app-server", "--listen", "stdio://"], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -21,7 +23,7 @@ export class AppServerClient {
     this.process.stderr.on("data", (chunk) => { this.stderr += chunk; });
     this.process.on("error", (error) => this.fail(error));
     this.process.on("exit", (code, signal) => {
-      if (!this.closed && code !== 0) this.fail(new Error(`codex app-server exited (${signal ?? code})${this.stderr.trim() ? `: ${this.stderr.trim()}` : ""}`));
+      if (!this.closed) this.fail(new Error(`codex app-server exited (${signal ?? code})${this.stderr.trim() ? `: ${this.stderr.trim()}` : ""}`));
     });
 
     const lines = readline.createInterface({ input: this.process.stdout });
@@ -47,6 +49,10 @@ export class AppServerClient {
 
   respond(id, result) {
     this.send({ id, result });
+  }
+
+  respondError(id, error) {
+    this.send({ id, error });
   }
 
   notify(method, params = {}) {
@@ -78,8 +84,11 @@ export class AppServerClient {
   }
 
   fail(error) {
+    if (this.failed) return;
+    this.failed = error;
     for (const { reject } of this.pending.values()) reject(error);
     this.pending.clear();
+    this.onFailure?.(error);
   }
 
   async close() {

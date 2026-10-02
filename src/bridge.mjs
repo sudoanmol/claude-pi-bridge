@@ -5,14 +5,15 @@ import { AppServerClient } from "./app-server-client.mjs";
 const MAX_CLARIFICATIONS = 3;
 
 export class Bridge {
-  constructor() {
+  constructor({ appServerCommand } = {}) {
     this.sessions = new Map();
+    this.appServerCommand = appServerCommand;
   }
 
   async session({ sessionId = randomUUID(), cwd = process.cwd(), model, effort, mode = "ask" } = {}) {
     if (this.sessions.has(sessionId)) return this.sessions.get(sessionId);
     const root = path.resolve(cwd);
-    const session = new CodexSession({ sessionId, cwd: root, model, effort, mode });
+    const session = new CodexSession({ sessionId, cwd: root, model, effort, mode, appServerCommand: this.appServerCommand });
     await session.start();
     this.sessions.set(sessionId, session);
     return session;
@@ -31,12 +32,13 @@ export class Bridge {
 }
 
 class CodexSession {
-  constructor({ sessionId, cwd, model, effort, mode }) {
+  constructor({ sessionId, cwd, model, effort, mode, appServerCommand }) {
     this.sessionId = sessionId;
     this.cwd = cwd;
     this.model = model;
     this.effort = effort;
     this.mode = mode;
+    this.appServerCommand = appServerCommand;
     this.clarifications = 0;
     this.pendingQuestion = null;
     this.active = null;
@@ -46,9 +48,12 @@ class CodexSession {
     this.client = new AppServerClient({
       cwd: this.cwd,
       onServerRequest: (message, client) => this.handleServerRequest(message, client),
-      onNotification: (message) => this.handleNotification(message)
+      onNotification: (message) => this.handleNotification(message),
+      onFailure: (error) => this.handleFailure(error),
+      command: this.appServerCommand
     });
     await this.client.start();
+    this.modelCatalog = await this.loadModels();
     const developerInstructions = [
       "You are Codex working as a peer to Claude Code.",
       "Work only inside the supplied repository and follow its AGENTS.md instructions.",
@@ -78,32 +83,41 @@ class CodexSession {
 
   async run(prompt, { model, effort } = {}) {
     if (this.active) throw new Error("This Codex session already has an active turn");
+    this.validateModelOptions(model ?? this.model, effort ?? this.effort);
     this.clarifications = 0;
     this.output = "";
-    const completion = new Promise((resolve, reject) => { this.active = { resolve, reject, turnId: null }; });
-    const started = await this.client.request("turn/start", {
-      threadId: this.threadId,
-      input: [{ type: "text", text: prompt }],
-      model: model ?? this.model ?? null,
-      effort: effort ?? this.effort ?? null,
-      cwd: this.cwd,
-      sandboxPolicy: { type: "readOnly" }
-    });
-    this.active.turnId = started.turn?.id ?? null;
-    const result = await completion;
-    if (result.status === "question") return { ...result, session_id: this.sessionId };
-    this.active = null;
-    return { ...result, session_id: this.sessionId };
+    this.active = { turnId: null };
+    const resultPromise = this.waitForActiveTurn();
+    try {
+      const started = await this.client.request("turn/start", {
+        threadId: this.threadId,
+        input: [{ type: "text", text: prompt }],
+        model: model ?? this.model ?? null,
+        effort: effort ?? this.effort ?? null,
+        cwd: this.cwd,
+        sandboxPolicy: { type: "readOnly" }
+      });
+      this.active.turnId = started.turn?.id ?? null;
+      const result = await resultPromise;
+      if (result.status !== "question") this.active = null;
+      return { ...result, session_id: this.sessionId };
+    } catch (error) {
+      this.active = null;
+      throw error;
+    }
   }
 
   async answer(questionId, answer) {
     const question = this.pendingQuestion;
     if (!question || question.id !== questionId) throw new Error(`Unknown question: ${questionId}`);
     this.pendingQuestion = null;
+    const completion = this.waitForActiveTurn();
     this.client.respond(question.rpcId, {
       answers: { [questionId]: { answers: [answer] } }
     });
-    return this.waitForActiveTurn();
+    const result = await completion;
+    if (result.status !== "question") this.active = null;
+    return { ...result, session_id: this.sessionId };
   }
 
   async steer(message) {
@@ -113,17 +127,29 @@ class CodexSession {
       expectedTurnId: this.active.turnId,
       input: [{ type: "text", text: message }]
     });
-    return this.waitForActiveTurn();
+    const result = await this.waitForActiveTurn();
+    this.active = null;
+    return { ...result, session_id: this.sessionId };
   }
 
   waitForActiveTurn() {
     if (!this.active) throw new Error("No active Codex turn");
+    if (this.active.result) {
+      const result = this.active.result;
+      this.active.result = null;
+      return Promise.resolve(result);
+    }
+    if (this.active.pause) {
+      const result = this.active.pause;
+      this.active.pause = null;
+      return Promise.resolve(result);
+    }
     return new Promise((resolve, reject) => { this.active.resume = { resolve, reject }; });
   }
 
   handleServerRequest(message, client) {
     if (message.method !== "item/tool/requestUserInput") {
-      client.respond(message.id, { answers: {} });
+      client.respondError(message.id, { code: -32601, message: `Unsupported Codex request: ${message.method}` });
       return;
     }
     const questions = message.params?.questions ?? [];
@@ -148,7 +174,34 @@ class CodexSession {
     if (!active) return;
     const result = { status: message.params?.turn?.status ?? "completed", response: this.output, turn: message.params?.turn ?? null };
     if (active.resume) { active.resume.resolve(result); active.resume = null; }
-    else { active.resolve(result); }
+    else active.result = result;
+  }
+
+  handleFailure(error) {
+    const active = this.active;
+    this.pendingQuestion = null;
+    this.active = null;
+    active?.reject?.(error);
+    active?.resume?.reject(error);
+  }
+
+  async loadModels() {
+    try {
+      const result = await this.client.request("model/list", { includeHidden: false });
+      return result.data ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  validateModelOptions(model, effort) {
+    if (!model && !effort) return;
+    const selected = model ? this.modelCatalog.find((entry) => entry.id === model || entry.model === model) : null;
+    if (model && !selected) throw new Error(`Unknown Codex model: ${model}. Use codex_models to list available models.`);
+    if (!effort) return;
+    const target = selected ?? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model);
+    const efforts = target?.supportedReasoningEfforts?.map((entry) => entry.reasoningEffort) ?? [];
+    if (efforts.length && !efforts.includes(effort)) throw new Error(`Unsupported reasoning effort "${effort}" for ${model ?? this.model}; supported: ${efforts.join(", ")}`);
   }
 
   status() {
@@ -160,6 +213,8 @@ class CodexSession {
       pending_question: this.pendingQuestion
     };
   }
+
+  models() { return this.modelCatalog ?? []; }
 
   async close() { await this.client?.close(); }
 }
