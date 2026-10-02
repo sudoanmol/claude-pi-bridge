@@ -62,6 +62,8 @@ test("a Codex clarification can round-trip through the bridge", async () => {
   const bridge = new Bridge({ appServerCommand: fake });
   try {
     const session = await bridge.session({ cwd: dir, model: "gpt-6-astra", effort: "high" });
+    await assert.rejects(session.ask("Ask me.", { model: "missing-model" }), /Unknown Codex model/);
+    await assert.rejects(session.ask("Ask me.", { model: "gpt-6-astra", effort: "low" }), /Unsupported reasoning effort/);
     const question = await session.ask("Ask me.");
     assert.equal(question.status, "question");
     assert.equal(question.question.question.question, "Which scope?");
