@@ -10,11 +10,22 @@ export class Bridge {
     this.appServerCommand = appServerCommand;
   }
 
-  async session({ sessionId = randomUUID(), cwd = process.cwd(), model, effort, mode = "ask" } = {}) {
-    if (this.sessions.has(sessionId)) return this.sessions.get(sessionId);
+  async session({ sessionId, cwd = process.cwd(), model, effort, mode = "ask" } = {}) {
+    if (sessionId && this.sessions.has(sessionId)) {
+      const existing = this.sessions.get(sessionId);
+      existing.assertConfig(model, effort);
+      return existing;
+    }
+    if (sessionId) throw new Error(`Unknown bridge session: ${sessionId}`);
+    sessionId = randomUUID();
     const root = path.resolve(cwd);
     const session = new CodexSession({ sessionId, cwd: root, model, effort, mode, appServerCommand: this.appServerCommand });
-    await session.start();
+    try {
+      await session.start();
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
     this.sessions.set(sessionId, session);
     return session;
   }
@@ -23,6 +34,13 @@ export class Bridge {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown bridge session: ${sessionId}`);
     return session;
+  }
+
+  async closeSession(sessionId) {
+    const session = this.get(sessionId);
+    await session.close();
+    this.sessions.delete(sessionId);
+    return { session_id: sessionId, closed: true };
   }
 
   async close() {
@@ -54,6 +72,14 @@ class CodexSession {
     });
     await this.client.start();
     this.modelCatalog = await this.loadModels();
+    const defaultModel = this.modelCatalog.find((entry) => entry.isDefault);
+    const selectedModel = this.model
+      ? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model)
+      : defaultModel;
+    if (this.model && !selectedModel) throw new Error(`Unknown Codex model: ${this.model}. Use codex_models to list available models.`);
+    this.model = selectedModel?.model ?? selectedModel?.id ?? null;
+    this.effort ??= selectedModel?.defaultReasoningEffort ?? null;
+    this.validateModelOptions(this.model, this.effort);
     const developerInstructions = [
       "You are Codex working as a peer to Claude Code.",
       "Work only inside the supplied repository and follow its AGENTS.md instructions.",
@@ -73,13 +99,13 @@ class CodexSession {
     if (!this.threadId) throw new Error("Codex did not return a thread id");
   }
 
-  async ask(prompt, { model, effort } = {}) {
-    return this.run(prompt, { model, effort });
+  async ask(prompt, options = {}) {
+    return this.run(prompt, options);
   }
 
-  async review({ prompt = "Review the current repository changes and report concrete findings.", base, model, effort } = {}) {
+  async review({ prompt = "Review the current repository changes and report concrete findings.", base, ...options } = {}) {
     const target = base ? `Review the changes from ${base} to HEAD.` : "Review the current uncommitted changes, including untracked files.";
-    return this.run(`${target}\n${prompt}\nDo not modify files. Ask Claude for clarification when needed.`, { model, effort });
+    return this.run(`${target}\n${prompt}\nDo not modify files. Ask Claude for clarification when needed.`, options);
   }
 
   async task(prompt, options = {}) {
@@ -87,26 +113,29 @@ class CodexSession {
     return this.run(`${prompt}\nMake the requested changes in the repository, then report what changed and any checks you ran. Ask Claude for clarification when needed.`, options);
   }
 
-  async run(prompt, { model, effort } = {}) {
+  async run(prompt, { model, effort, include_commentary = false, wait = true } = {}) {
+    if (this.active?.result) this.active = null;
     if (this.active) throw new Error("This Codex session already has an active turn");
-    this.validateModelOptions(model ?? this.model, effort ?? this.effort);
+    this.assertConfig(model, effort);
     this.clarifications = 0;
     this.output = "";
-    this.active = { turnId: null };
-    const resultPromise = this.waitForActiveTurn();
+    this.messages = new Map();
+    this.active = { turnId: null, includeCommentary: include_commentary, startedAt: Date.now() };
+    const resultPromise = wait ? this.waitForActiveTurn() : null;
     try {
       const started = await this.client.request("turn/start", {
         threadId: this.threadId,
         input: [{ type: "text", text: prompt }],
-        model: model ?? this.model ?? null,
-        effort: effort ?? this.effort ?? null,
+        model: this.model,
+        effort: this.effort,
         cwd: this.cwd,
         sandboxPolicy: this.mode === "task" ? { type: "workspaceWrite", writableRoots: [this.cwd] } : { type: "readOnly" }
       });
       this.active.turnId = started.turn?.id ?? null;
+      if (!wait) return this.envelope({ status: "started", turn: this.summarizeTurn(started.turn ?? { id: this.active.turnId, status: "inProgress" }) });
       const result = await resultPromise;
       if (result.status !== "question") this.active = null;
-      return { ...result, session_id: this.sessionId };
+      return this.envelope(result);
     } catch (error) {
       this.active = null;
       throw error;
@@ -121,7 +150,7 @@ class CodexSession {
     if (next) {
       question.id = next.id;
       question.question = next;
-      return { status: "question", question, session_id: this.sessionId };
+      return this.envelope({ status: "question", question });
     }
     this.pendingQuestion = null;
     const completion = this.waitForActiveTurn();
@@ -130,11 +159,12 @@ class CodexSession {
     });
     const result = await completion;
     if (result.status !== "question") this.active = null;
-    return { ...result, session_id: this.sessionId };
+    return this.envelope(result);
   }
 
   async steer(message) {
     if (!this.active?.turnId) throw new Error("No active Codex turn to steer");
+    if (this.active.result) throw new Error("The Codex turn has already completed");
     await this.client.request("turn/steer", {
       threadId: this.threadId,
       expectedTurnId: this.active.turnId,
@@ -142,7 +172,7 @@ class CodexSession {
     });
     const result = await this.waitForActiveTurn();
     if (result.status !== "question") this.active = null;
-    return { ...result, session_id: this.sessionId };
+    return this.envelope(result);
   }
 
   waitForActiveTurn() {
@@ -181,13 +211,33 @@ class CodexSession {
   }
 
   handleNotification(message) {
-    if (message.method === "item/agentMessage/delta") this.output += message.params?.delta ?? "";
+    if (message.method === "item/agentMessage/delta") {
+      const itemId = message.params?.itemId ?? "default";
+      this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${message.params?.delta ?? ""}`);
+      this.output += message.params?.delta ?? "";
+    }
     if (message.method !== "turn/completed") return;
     const active = this.active;
     if (!active) return;
-    const result = { status: message.params?.turn?.status ?? "completed", response: this.output, turn: message.params?.turn ?? null };
+    const turn = message.params?.turn ?? null;
+    const final = turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
+    const response = active.includeCommentary ? [...this.messages.values()].join("\n") : final ?? this.output;
+    const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
     if (active.resume) { active.resume.resolve(result); active.resume = null; }
     else active.result = result;
+  }
+
+  summarizeTurn(turn) {
+    if (!turn) return null;
+    return {
+      id: turn.id,
+      status: turn.status,
+      error: turn.error ?? null,
+      startedAt: turn.startedAt ?? null,
+      completedAt: turn.completedAt ?? null,
+      durationMs: turn.durationMs ?? null,
+      item_ids: (turn.items ?? []).map((item) => item.id).filter(Boolean)
+    };
   }
 
   handleFailure(error) {
@@ -217,18 +267,41 @@ class CodexSession {
     if (efforts.length && !efforts.includes(effort)) throw new Error(`Unsupported reasoning effort "${effort}" for ${model ?? this.model}; supported: ${efforts.join(", ")}`);
   }
 
+  assertConfig(model, effort) {
+    if (model !== undefined && model !== this.model) throw new Error(`This session uses model "${this.model}". Start a new session to change model.`);
+    if (effort !== undefined && effort !== this.effort) throw new Error(`This session uses reasoning effort "${this.effort}". Start a new session to change effort.`);
+  }
+
+  envelope(result) {
+    return { ...result, session_id: this.sessionId, model: this.model, effort: this.effort };
+  }
+
   status() {
     return {
       session_id: this.sessionId,
       thread_id: this.threadId,
       cwd: this.cwd,
       mode: this.mode,
-      active: Boolean(this.active),
-      pending_question: this.pendingQuestion
+      model: this.model,
+      effort: this.effort,
+      active: Boolean(this.active && !this.active.result),
+      turn_id: this.active?.turnId ?? null,
+      elapsed_ms: this.active?.startedAt ? Date.now() - this.active.startedAt : null,
+      pending_question: this.pendingQuestion,
+      result: this.active?.result ?? null
     };
   }
 
-  models() { return this.modelCatalog ?? []; }
+  models(verbose = false) {
+    if (verbose) return this.modelCatalog ?? [];
+    return (this.modelCatalog ?? []).map((entry) => ({
+      id: entry.model ?? entry.id,
+      displayName: entry.displayName,
+      isDefault: entry.isDefault,
+      defaultReasoningEffort: entry.defaultReasoningEffort,
+      supportedReasoningEfforts: (entry.supportedReasoningEfforts ?? []).map((effort) => effort.reasoningEffort)
+    }));
+  }
 
   async close() { await this.client?.close(); }
 }

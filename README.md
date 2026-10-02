@@ -26,9 +26,10 @@ codex --version
 - `codex_models` lists available models and each model's supported reasoning efforts.
 - `codex_steer` sends feedback while a Codex turn is active.
 - `codex_answer` answers a question that Codex sends back.
-- `codex_status` shows the thread and any pending question.
+- `codex_status` shows the thread, progress, model, effort, and any pending question.
+- `codex_close` closes a session and its local app-server process.
 
-Pass `model` and `effort` on `codex_ask`, `codex_task`, or `codex_review`. The bridge validates them against `model/list`; for example, use `model: "gpt-6-astra"` and an effort returned by `codex_models`.
+Pass `model` and `effort` only when starting a session. The bridge validates them against `model/list`; for example, use `model: "gpt-6-astra"` and an effort returned by `codex_models`. A session keeps that configuration for every turn.
 
 ## The conversation loop
 
@@ -37,6 +38,8 @@ Pass `model` and `effort` on `codex_ask`, `codex_task`, or `codex_review`. The b
 3. Claude answers with `codex_answer` and the same `session_id` and `question_id`.
 4. Claude can send corrections or review feedback with `codex_steer` while Codex is working.
 5. Codex returns `status: "completed"` with its response and turn metadata.
+
+Set `wait: false` to return after Codex starts a turn. Use `codex_status` for progress, then use `codex_steer` or `codex_answer` while the turn is active.
 
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 

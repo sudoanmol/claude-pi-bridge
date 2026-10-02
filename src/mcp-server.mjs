@@ -14,8 +14,10 @@ const tools = [
         prompt: { type: "string" },
         session_id: { type: "string" },
         cwd: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" }
+        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
+        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
       },
       required: ["prompt"]
     }
@@ -29,8 +31,10 @@ const tools = [
         prompt: { type: "string" },
         session_id: { type: "string" },
         cwd: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" }
+        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
+        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
       },
       required: ["prompt"]
     }
@@ -45,8 +49,10 @@ const tools = [
         base: { type: "string" },
         session_id: { type: "string" },
         cwd: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" }
+        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
+        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
+        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
       }
     }
   },
@@ -73,7 +79,16 @@ const tools = [
     description: "List Codex models and the reasoning efforts each model supports.",
     inputSchema: {
       type: "object",
-      properties: { session_id: { type: "string" }, cwd: { type: "string" } }
+      properties: { session_id: { type: "string" }, cwd: { type: "string" }, verbose: { type: "boolean" } }
+    }
+  },
+  {
+    name: "codex_close",
+    description: "Close a Codex session and its local app-server process.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" } },
+      required: ["session_id"]
     }
   },
   {
@@ -89,7 +104,7 @@ const tools = [
 
 async function callTool(name, args = {}) {
   if (name === "codex_ask") {
-    const session = await bridge.session(args);
+    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session(args);
     return session.ask(args.prompt, args);
   }
   if (name === "codex_task") {
@@ -97,15 +112,16 @@ async function callTool(name, args = {}) {
     return session.task(args.prompt, args);
   }
   if (name === "codex_review") {
-    const session = await bridge.session({ ...args, mode: "review" });
+    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ ...args, mode: "review" });
     return session.review(args);
   }
   if (name === "codex_answer") return bridge.get(args.session_id).answer(args.question_id, args.answer);
   if (name === "codex_steer") return bridge.get(args.session_id).steer(args.message);
   if (name === "codex_models") {
     const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ cwd: args.cwd });
-    return { session_id: session.sessionId, models: session.models() };
+    return { session_id: session.sessionId, models: session.models(args.verbose === true) };
   }
+  if (name === "codex_close") return bridge.closeSession(args.session_id);
   if (name === "codex_status") return bridge.get(args.session_id).status();
   throw new Error(`Unknown tool: ${name}`);
 }
