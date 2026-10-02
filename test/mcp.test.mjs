@@ -46,7 +46,7 @@ test("a Codex clarification can round-trip through the bridge", async () => {
         if (!questionSent) {
           questionSent = true;
           send({ id: message.id, result: { turn: { id: "turn-1" } } });
-          return setTimeout(() => send({ id: 90, method: "item/tool/requestUserInput", params: { questions: [{ id: "scope", question: "Which scope?" }] } }), 5);
+          return setTimeout(() => send({ id: 90, method: "item/tool/requestUserInput", params: { questions: [{ id: "scope", question: "Which scope?" }, { id: "format", question: "Which format?" }] } }), 5);
         }
         return send({ id: message.id, result: { turn: { id: "turn-1" } } });
       }
@@ -67,7 +67,10 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     const question = await session.ask("Ask me.");
     assert.equal(question.status, "question");
     assert.equal(question.question.question.question, "Which scope?");
-    const answer = await session.answer("scope", "the repository");
+    const nextQuestion = await session.answer("scope", "the repository");
+    assert.equal(nextQuestion.status, "question");
+    assert.equal(nextQuestion.question.question.question, "Which format?");
+    const answer = await session.answer("format", "plain text");
     assert.equal(answer.status, "completed");
     assert.equal(answer.response, "READY");
   } finally {

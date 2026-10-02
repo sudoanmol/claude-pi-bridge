@@ -115,11 +115,18 @@ class CodexSession {
 
   async answer(questionId, answer) {
     const question = this.pendingQuestion;
-    if (!question || question.id !== questionId) throw new Error(`Unknown question: ${questionId}`);
+    if (!question || !question.questions.some((entry) => entry.id === questionId)) throw new Error(`Unknown question: ${questionId}`);
+    question.answers[questionId] = { answers: [answer] };
+    const next = question.questions.find((entry) => !question.answers[entry.id]);
+    if (next) {
+      question.id = next.id;
+      question.question = next;
+      return { status: "question", question, session_id: this.sessionId };
+    }
     this.pendingQuestion = null;
     const completion = this.waitForActiveTurn();
     this.client.respond(question.rpcId, {
-      answers: { [questionId]: { answers: [answer] } }
+      answers: question.answers
     });
     const result = await completion;
     if (result.status !== "question") this.active = null;
@@ -166,7 +173,7 @@ class CodexSession {
     this.clarifications += 1;
     const question = questions[0];
     if (!question) return client.respond(message.id, { answers: {} });
-    this.pendingQuestion = { id: question.id, rpcId: message.id, question, sessionId: this.sessionId };
+    this.pendingQuestion = { id: question.id, rpcId: message.id, question, questions, answers: {}, sessionId: this.sessionId };
     const active = this.active;
     const result = { status: "question", question: this.pendingQuestion };
     if (active?.resume) { active.resume.resolve(result); active.resume = null; }
