@@ -157,3 +157,35 @@ test("close and app-server failure release pending waits", async (t) => {
     await assert.rejects(session.wait(0, 0), fail ? /disconnected/ : /closed/);
   }
 });
+
+test("wait batches activity, ignores reasoning, and returns terminal events immediately", async (t) => {
+  const session = await sessionFor(t);
+  await session.ask("Observe", { wait: false });
+
+  const quiet = session.wait(0, 200);
+  emit(session, "item/started", { item: { type: "reasoning", id: "think" } });
+  emit(session, "item/completed", { item: { type: "reasoning", id: "think" } });
+  emit(session, "item/started", { item: { type: "agentMessage", id: "msg" } });
+  const idle = await quiet;
+  assert.equal(idle.status, "running");
+  assert.deepEqual(idle.activity, []);
+  assert.equal(idle.running.item_id, "msg");
+
+  const startedAt = Date.now();
+  const batched = session.wait(idle.activity_latest_seq, 10000);
+  emit(session, "item/started", { item: { type: "commandExecution", id: "a", command: "true" } });
+  emit(session, "item/completed", { item: { type: "commandExecution", id: "a", command: "true", exitCode: 0 } });
+  emit(session, "item/completed", { item: { type: "fileChange", id: "f", changes: [{ path: "slug.py" }] } });
+  const batch = await batched;
+  assert.equal(batch.status, "updated");
+  assert.deepEqual(batch.activity.map((event) => event.item_id), ["a", "f"]);
+  assert.ok(Date.now() - startedAt >= 2900, "updates are held for the batch window");
+
+  const finishing = session.wait(batch.activity_latest_seq, 10000);
+  emit(session, "item/completed", { item: { type: "agentMessage", id: "msg", text: "Done" } });
+  const completedAt = Date.now();
+  complete(session);
+  const finished = await finishing;
+  assert.equal(finished.status, "completed");
+  assert.ok(Date.now() - completedAt < 500, "completion is not delayed by the batch window");
+});

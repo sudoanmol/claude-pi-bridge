@@ -97,7 +97,7 @@ const tools = [
   },
   {
     name: "codex_wait",
-    description: "Wait for new Codex activity, a clarification question, or completion without sending instructions. After wait:false, call repeatedly with the last activity_latest_seq as since.",
+    description: "Wait for new Codex activity, a clarification question, or completion without sending instructions. Activity is batched for a few seconds after the first new event; questions and completion return immediately. Reasoning steps appear only in running. After wait:false, call repeatedly with the last activity_latest_seq as since.",
     inputSchema: {
       type: "object",
       properties: {

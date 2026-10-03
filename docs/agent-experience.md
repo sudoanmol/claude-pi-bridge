@@ -222,6 +222,47 @@ The log is also larger than it needs to be:
 - Read-only sessions on macOS show `git: error: couldn't create cache file '/tmp/xcrun_db-…' (errno=Operation not permitted)`. One `git status` returned exit 1 even though it printed output. The read-only sandbox blocks `xcrun`'s cache write to `/tmp`, so Codex may misread git failures during reviews. Setting `TMPDIR` to a writable sandbox path might help; this has not been tested.
 - Blocking questions carry their own ID, for example `slug_contract`. Async questions without an ID receive a generated short ID such as `q1`, so both paths give Claude a compact value for `codex_answer`.
 
+## Retest at 18:00: `codex_wait` supervision loop
+
+Setup: bridge at `ce3837b`, `gpt-6.1-sol`/`low`. The task was a `codex_task` in the scratch repository to turn underscores into hyphens in `slugify`, started with `wait: false`.
+
+**Finding 10 is fixed.** Claude supervised the whole turn with `codex_wait(since=activity_latest_seq)` and never busy-polled or blocked.
+
+- Each response held only new events, plus `running` and `status: "updated"` or `"completed"`.
+- The last call returned `active: false` with the final `result`.
+- Claude saw the file change on `slug.py` (seq 14), then `python3 slug.py && git diff` with exit 0 (seq 20).
+- Claude checked the resulting diff independently, and `python3 slug.py` printed `ok`.
+
+**New issue: `codex_wait` returns after every event.** The 41 s turn took 16 `codex_wait` calls. That is one round trip about every 2 s, and most carried a single reasoning start or completion that says nothing Claude can act on. Every call costs a full model turn on the Claude side. So event-driven waiting is now cheaper per call than polling `codex_status`, but it is still chatty.
+
+**Fix.**
+
+- Batch the response. After the first new event, keep collecting for a short window, for example 3 to 5 s, then return everything at once. Return immediately for a question or a completed turn.
+- Skip reasoning start and completion events by default. `running` already shows that Codex is thinking.
+- Wake the caller only for events it can act on: a completed command with its exit code, a file change, an agent message, a question, or completion.
+- Optionally accept `min_interval_ms` so the caller can choose between watching closely and checking less often.
+
+With these changes, this turn would have taken about 4 to 6 calls instead of 16.
+
+**Finding 11 is partly open.** Claude Code picked up the new `codex_wait` tool after the reload. It still offered the old `codex_status` definition, without `since`. This supports the theory that Claude Code keeps definitions for tools it already knows and adds only new ones. `codex_wait` returns only new events, so it mostly avoids the size problem for supervision.
+
 ## Not yet exercised
 
 The `MAX_CLARIFICATIONS` fallback, and `codex_review` with `base`.
+
+## Fix at 18:20: batched `codex_wait` and plugin-only MCP config
+
+**Batching.** `codex_wait` no longer returns on the first event. After the first new activity, it collects for `WAIT_BATCH_MS` (3 s) and then returns everything that arrived. A pending question, a completed turn, and an app-server failure still return immediately. When the timeout comes first, the response reports `updated` instead of `running` if activity arrived. Reasoning items and agent-message starts no longer create activity entries; they appear only in `running`. The new test in `test/wait.test.mjs` covers each of these behaviors.
+
+**Live check.** A `gpt-6.1-sol`/`low` task in the scratch repository added a docstring and ran `python3 slug.py`. The `wait` loop driving it needed 6 calls for a 41 s turn, down from 16 for a comparable turn before batching:
+
+```text
++10.2s call 1: updated   | message
++15.3s call 2: updated   | command(exit 0) ×3
++23.8s call 3: updated   | command(exit 0)
++31.5s call 4: updated   | command(exit 0)
++39.8s call 5: updated   | file_change[slug.py], command(exit 0)
++40.6s call 6: completed | message
+```
+
+**MCP config.** `.mcp.json` at the repository root also served as project-scope MCP config. When Claude Code opened this repository as a project, it started that server without `CLAUDE_PLUGIN_ROOT` set, and the server failed with `CONNECTION_CLOSED`. The server is now declared in `.claude-plugin/plugin.json`, and `.mcp.json` has been removed.

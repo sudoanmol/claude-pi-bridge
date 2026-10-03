@@ -6,6 +6,10 @@ const MAX_CLARIFICATIONS = 3;
 const MAX_ACTIVITY = 200;
 const WAIT_TIMEOUT_MS = 100_000;
 const WAIT_TOOL_TIMEOUT_MS = 90_000;
+// After the first new event, keep collecting so one wait returns a batch instead of a single event.
+const WAIT_BATCH_MS = 3_000;
+// Visible through `running`; recording them would wake waiters without anything to act on.
+const QUIET_STARTS = new Set(["reasoning", "agentMessage"]);
 
 export class Bridge {
   constructor({ appServerCommand } = {}) {
@@ -305,6 +309,7 @@ class CodexSession {
     const item = this.describeItem(params.item);
     if (item.source_type === "userMessage") return;
     this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
+    if (QUIET_STARTS.has(item.source_type)) return;
     this.recordActivity({ phase: "started", ...item }, item.item_id);
   }
 
@@ -314,7 +319,7 @@ class CodexSession {
     if (item.source_type === "agentMessage" && params.item?.questions?.length && this.active) {
       if (this.pendingQuestion?.item_id !== item.item_id) this.publishAsyncQuestion(params.item.questions, this.active, item.item_id);
     }
-    if (item.source_type !== "userMessage") this.recordActivity({ phase: "completed", ...item }, item.item_id);
+    if (item.source_type !== "userMessage" && item.source_type !== "reasoning") this.recordActivity({ phase: "completed", ...item }, item.item_id);
   }
 
   publishAsyncQuestion(rawQuestions, active, itemId = null, turn = null) {
@@ -402,13 +407,18 @@ class CodexSession {
     const reason = this.waitReason(snapshot);
     if (reason) return Promise.resolve({ ...snapshot, status: reason });
     return new Promise((resolve, reject) => {
-      const waiter = { since, resolve, reject, timer: null };
-      waiter.timer = setTimeout(() => {
-        this.waiters.delete(waiter);
-        resolve({ ...this.status(since), status: "running" });
-      }, Math.min(timeoutMs, WAIT_TOOL_TIMEOUT_MS));
+      const waiter = { since, resolve, reject, timer: null, batchTimer: null };
+      waiter.timer = setTimeout(() => this.settleWaiter(waiter), Math.min(timeoutMs, WAIT_TOOL_TIMEOUT_MS));
       this.waiters.add(waiter);
     });
+  }
+
+  settleWaiter(waiter) {
+    this.waiters.delete(waiter);
+    clearTimeout(waiter.timer);
+    clearTimeout(waiter.batchTimer);
+    const snapshot = this.status(waiter.since);
+    waiter.resolve({ ...snapshot, status: this.waitReason(snapshot) ?? "running" });
   }
 
   waitReason(snapshot) {
@@ -421,12 +431,10 @@ class CodexSession {
 
   notifyWaiters() {
     for (const waiter of this.waiters) {
-      const snapshot = this.status(waiter.since);
-      const reason = this.waitReason(snapshot);
+      const reason = this.waitReason(this.status(waiter.since));
       if (!reason) continue;
-      this.waiters.delete(waiter);
-      clearTimeout(waiter.timer);
-      waiter.resolve({ ...snapshot, status: reason });
+      if (reason !== "updated") this.settleWaiter(waiter);
+      else waiter.batchTimer ??= setTimeout(() => this.settleWaiter(waiter), WAIT_BATCH_MS);
     }
   }
 
@@ -450,6 +458,7 @@ class CodexSession {
     this.active = null;
     for (const waiter of this.waiters) {
       clearTimeout(waiter.timer);
+      clearTimeout(waiter.batchTimer);
       waiter.reject(error);
     }
     this.waiters.clear();

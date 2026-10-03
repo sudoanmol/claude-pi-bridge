@@ -10,7 +10,7 @@ From Claude Code, load this directory as a local plugin:
 /Users/anmolhurkat/Developer/claude-codex-bridge
 ```
 
-The plugin starts `src/mcp-server.mjs` over stdio. The bridge uses the `codex` executable on `PATH`. Set `CODEX_BIN` when Codex lives elsewhere.
+The plugin starts `src/mcp-server.mjs` over stdio, as declared in `.claude-plugin/plugin.json`. The repository has no root `.mcp.json`, so opening it as a project does not start a second, unconfigured server. The bridge uses the `codex` executable on `PATH`. Set `CODEX_BIN` when Codex lives elsewhere.
 
 Codex must be installed and authenticated before you use the tools:
 
@@ -53,7 +53,7 @@ Set `wait: false` to return after Codex starts a turn. Call `codex_wait` with th
 
 `wait: true` returns a question or completion as soon as one arrives and is capped at 100 seconds. A longer turn returns `status: "running"` with its `session_id`; continue with `codex_status`, `codex_steer`, or `codex_answer`.
 
-`codex_wait` is capped at 90 seconds. Pass the last `activity_latest_seq` as `since`; updated activity items receive a new sequence number. Restart Claude Code after installing a new plugin version so it reloads the MCP tool definitions.
+`codex_wait` is capped at 90 seconds. Pass the last `activity_latest_seq` as `since`; updated activity items receive a new sequence number. After the first new event it keeps collecting for 3 seconds, so one call returns a batch. Questions and completion return immediately. Reasoning steps never wake a wait; they show only in `running`. Restart Claude Code after installing a new plugin version so it reloads the MCP tool definitions.
 
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 
