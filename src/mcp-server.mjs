@@ -93,10 +93,10 @@ const tools = [
   },
   {
     name: "codex_status",
-    description: "Inspect a Codex bridge session and any pending clarification question.",
+    description: "Poll Codex progress, commands, file changes, tool calls, and pending clarification questions. Pass since to receive only new activity.",
     inputSchema: {
       type: "object",
-      properties: { session_id: { type: "string" } },
+      properties: { session_id: { type: "string" }, since: { type: "integer", minimum: 0, description: "Return activity events after this sequence number." } },
       required: ["session_id"]
     }
   }
@@ -130,7 +130,7 @@ async function callTool(name, args = {}) {
     }
   }
   if (name === "codex_close") return bridge.closeSession(args.session_id);
-  if (name === "codex_status") return bridge.get(args.session_id).status();
+  if (name === "codex_status") return bridge.get(args.session_id).status(args.since ?? 0);
   throw new Error(`Unknown tool: ${name}`);
 }
 

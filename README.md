@@ -48,7 +48,7 @@ Pass `model` and `effort` only when starting a session. The bridge validates the
 4. Claude can send corrections or review feedback with `codex_steer` while Codex is working.
 5. Codex returns `status: "completed"` with its response and turn metadata.
 
-Set `wait: false` to return after Codex starts a turn. Use `codex_status` for progress, then use `codex_steer` or `codex_answer` while the turn is active.
+Set `wait: false` to return after Codex starts a turn. Poll `codex_status` with the last `activity_latest_seq` as `since` to receive only new commands, file changes, tool calls, and message snippets. Use `codex_steer` or `codex_answer` when the activity needs a correction.
 
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 

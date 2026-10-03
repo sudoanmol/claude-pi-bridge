@@ -7,3 +7,5 @@ tools: mcp__codex__codex_ask, mcp__codex__codex_task, mcp__codex__codex_review, 
 Use the matching Codex tool for the request.
 
 If the result has `status: "question"`, answer the returned question using `codex_answer`, then return Codex's continued response. Do not ask the human for repository facts that Claude can answer from the current context.
+
+For background turns, call the tool with `wait: false`, poll `codex_status` with `since` until it completes, and steer when the activity shows the work moving off scope.

@@ -90,6 +90,27 @@ The synchronous handler remains in place because which question mechanism Codex 
 - Results include `durationMs` but no token usage. This is acceptable for now; do not add a token-usage layer unless the app-server exposes a stable value that the agent experience needs.
 - The `model` and `effort` schema fields have no descriptions. Agents only find the valid values if they already know about `codex_models`.
 
+## 9. Claude steers blind: no live view of Codex's work
+
+**Observed.** With `wait: false`, `codex_status` reports only `active`, `turn_id`, `elapsed_ms`, `pending_question`, and the final `result`. While a turn runs, Claude cannot see which commands Codex ran, their exit codes, which files it read or changed, or any partial message. In the finding 4 retest, Claude's steer worked only because Claude had written the scope correction beforehand. Claude had not seen anything go wrong. An agent that cannot observe the work can only interrupt on a schedule or on a hunch. That makes `codex_steer` close to useless, and a `codex_task` that edits files is effectively unsupervised until it finishes.
+
+**Cause.** The app-server streams every step of the turn as notifications, but `handleNotification` (`src/bridge.mjs:236`) keeps only `item/agentMessage/delta` text and `turn/completed`. It drops everything else, including `item/started` and `item/completed` for command executions, file changes, and tool calls. The messages it does keep are not exposed through `codex_status` until the turn completes.
+
+MCP adds a second limit. A tool call is one request and one response, so any progress notification the bridge sends never reaches Claude while Claude waits on the call. The only way for the caller to see progress is to poll.
+
+**Fix.**
+
+- Record a bounded activity log per turn from `item/started` and `item/completed`, for example the last 200 events. Keep each event short: commands with their working directory and exit code, changed file paths with a diff summary, tool or MCP calls, and agent message snippets. Leave out full output.
+- Give each event a sequence number. Add `since` to `codex_status` so a poll returns only the events after that number, along with the latest number. Polling then costs only what is new, and Claude never has to re-read the log.
+- Include the current in-progress item in `codex_status`, such as `running: "bun test apps/runner/src/foo.test.ts" (12s)`, so Claude can tell a slow step from a stuck one.
+- Document the supervision loop in the tool descriptions and in `agents/codex-consult.md`: start with `wait: false`, poll `codex_status` with `since`, and call `codex_steer` when the activity goes off track. Then wait for completion.
+
+This matches how Codex's own TUI and IDE clients show live progress: they render the same `item/*` notifications.
+
+**Workaround until then.** Codex writes every step to its rollout log, `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`. Claude can follow that file for function calls and their outputs. The log is an internal Codex format and not a supported interface, so do not build on it.
+
+**Status.** The bridge now keeps the last 200 bounded activity events per turn. `codex_status` accepts `since` and returns only newer events, the current running item, its elapsed time, and the latest sequence number. Start background work with `wait: false`, poll with `since`, and steer from observed activity.
+
 ## Retest after fixes (2026-10-02, 17:10)
 
 | Finding | Result |
@@ -97,7 +118,7 @@ The synchronous handler remains in place because which question mechanism Codex 
 | 1. Session continuation | Fixed. The `session_id` stayed the same across turns, and Codex quoted its earlier question without being given it. |
 | 2. Model locked per session | Fixed. Passing `model: "gpt-6-astra"` on a `gpt-6.1-sol` session was rejected with "Start a new session to change model." Results report `model` and `effort`. |
 | 3. Structured clarification | Fixed. Both blocking requests and completed agent messages with async questions now reach `codex_answer`. |
-| 4. Steer an active turn | Fixed. `wait: false` returned `status: "started"`. `codex_steer` then changed the scope of the same turn ID, and Codex followed the correction. |
+| 4. Steer an active turn | Works, but blind. `wait: false` returned `status: "started"`. `codex_steer` then changed the scope of the same turn ID, and Codex followed the correction. Claude could not see the turn's progress before steering; see finding 9. |
 | 5. Clean response | Fixed. `response` contains only the final answer, and `turn.item_ids` replaces the duplicated items. |
 | 6. Trimmed model list | Fixed. |
 | 7. Process cleanup | Fixed. `codex_close` returned `closed: true`, and no `codex app-server --listen stdio://` processes remained. |

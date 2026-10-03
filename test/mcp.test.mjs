@@ -56,6 +56,9 @@ test("a Codex clarification can round-trip through the bridge", async () => {
         if (!normalTurnSent) {
           normalTurnSent = true;
           return setTimeout(() => {
+            const command = { type: "commandExecution", id: "cmd-1", command: "npm test", cwd: "/repo", status: "inProgress", commandActions: [] };
+            send({ method: "item/started", params: { item: command, startedAtMs: Date.now() } });
+            send({ method: "item/completed", params: { item: { ...command, status: "completed", exitCode: 0 }, completedAtMs: Date.now() } });
             send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
             send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
           }, 5);
@@ -95,6 +98,9 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     assert.equal(answer.response, "READY");
     const continuation = await session.ask("Ask again.");
     assert.equal(continuation.status, "completed");
+    const activity = session.status();
+    assert.equal(activity.activity.find((event) => event.kind === "command" && event.phase === "completed").exit_code, 0);
+    assert.deepEqual(session.status(activity.activity_latest_seq).activity, []);
     const started = await session.ask("Run asynchronously.", { wait: false });
     assert.equal(started.status, "started");
     await new Promise((resolve) => setTimeout(resolve, 20));

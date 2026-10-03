@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { AppServerClient } from "./app-server-client.mjs";
 
 const MAX_CLARIFICATIONS = 3;
+const MAX_ACTIVITY = 200;
 
 export class Bridge {
   constructor({ appServerCommand } = {}) {
@@ -60,6 +61,9 @@ class CodexSession {
     this.clarifications = 0;
     this.pendingQuestion = null;
     this.active = null;
+    this.activity = [];
+    this.activitySeq = 0;
+    this.running = null;
   }
 
   async start() {
@@ -127,6 +131,10 @@ class CodexSession {
     this.clarifications = 0;
     this.output = "";
     this.messages = new Map();
+    this.messageActivity = new Map();
+    this.activity = [];
+    this.activitySeq = 0;
+    this.running = null;
     this.active = { turnId: null, includeCommentary: include_commentary, startedAt: Date.now() };
     const resultPromise = wait ? this.waitForActiveTurn() : null;
     try {
@@ -234,10 +242,25 @@ class CodexSession {
   }
 
   handleNotification(message) {
+    if (message.method === "item/started") return this.handleItemStarted(message.params);
+    if (message.method === "item/completed") return this.handleItemCompleted(message.params);
+    if (message.method === "item/commandExecution/outputDelta") return this.recordActivity({ kind: "command_output", item_id: message.params?.itemId, text: this.shortText(message.params?.delta) });
+    if (message.method === "item/mcpToolCall/progress") return this.recordActivity({ kind: "mcp_progress", item_id: message.params?.itemId, text: this.shortText(message.params?.message) });
+    if (message.method === "turn/plan/updated") return this.recordActivity({ kind: "plan", text: this.shortText(message.params?.explanation ?? message.params?.plan?.map((step) => step.step ?? step).join("; ")) });
     if (message.method === "item/agentMessage/delta") {
       const itemId = message.params?.itemId ?? "default";
-      this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${message.params?.delta ?? ""}`);
-      this.output += message.params?.delta ?? "";
+      const delta = message.params?.delta ?? "";
+      this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${delta}`);
+      this.output += delta;
+      const state = this.messageActivity.get(itemId) ?? { pending: "", emittedAt: 0 };
+      state.pending += delta;
+      const now = Date.now();
+      if (now - state.emittedAt >= 500 || state.pending.length >= 160) {
+        this.recordActivity({ kind: "message", item_id: itemId, text: this.shortText(state.pending) });
+        state.pending = "";
+        state.emittedAt = now;
+      }
+      this.messageActivity.set(itemId, state);
     }
     if (message.method !== "turn/completed") return;
     const active = this.active;
@@ -271,6 +294,40 @@ class CodexSession {
     const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
     if (active.resume) { active.resume.resolve(result); active.resume = null; }
     else active.result = result;
+  }
+
+  handleItemStarted(params = {}) {
+    const item = this.describeItem(params.item);
+    this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
+    this.recordActivity({ phase: "started", ...item });
+  }
+
+  handleItemCompleted(params = {}) {
+    const item = this.describeItem(params.item);
+    this.recordActivity({ phase: "completed", ...item });
+    if (this.running?.item_id === item.item_id) this.running = null;
+  }
+
+  describeItem(item = {}) {
+    const base = { item_id: item.id ?? null, source_type: item.type ?? "unknown" };
+    if (item.type === "commandExecution") return { ...base, kind: "command", command: this.shortText(item.command, 240), cwd: item.cwd ?? null, status: item.status ?? null, exit_code: item.exitCode ?? null };
+    if (item.type === "fileChange") return { ...base, kind: "file_change", status: item.status ?? null, files: (item.changes ?? []).map((change) => change.path).filter(Boolean) };
+    if (item.type === "mcpToolCall") return { ...base, kind: "mcp_tool", server: item.server ?? null, tool: item.tool ?? null, status: item.status ?? null };
+    if (item.type === "agentMessage") return { ...base, kind: "message", text: this.shortText(item.text) };
+    if (item.type === "plan") return { ...base, kind: "plan", text: this.shortText(item.text) };
+    return base;
+  }
+
+  shortText(value, limit = 200) {
+    if (!value) return null;
+    const text = String(value).replace(/\s+/g, " ").trim();
+    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  }
+
+  recordActivity(event) {
+    const entry = { seq: ++this.activitySeq, at: Date.now(), ...event };
+    this.activity.push(entry);
+    if (this.activity.length > MAX_ACTIVITY) this.activity.shift();
   }
 
   summarizeTurn(turn) {
@@ -322,7 +379,8 @@ class CodexSession {
     return { ...result, session_id: this.sessionId, model: this.model, effort: this.effort };
   }
 
-  status() {
+  status(since = 0) {
+    const firstSeq = this.activity[0]?.seq ?? this.activitySeq + 1;
     return {
       session_id: this.sessionId,
       thread_id: this.threadId,
@@ -333,6 +391,10 @@ class CodexSession {
       active: Boolean(this.active && !this.active.result),
       turn_id: this.active?.turnId ?? null,
       elapsed_ms: this.active?.startedAt ? Date.now() - this.active.startedAt : null,
+      running: this.running ? { ...this.running, elapsed_ms: Math.max(0, Date.now() - this.running.started_at) } : null,
+      activity: this.activity.filter((event) => event.seq > since),
+      activity_latest_seq: this.activitySeq,
+      activity_truncated: since < firstSeq - 1,
       pending_question: this.pendingQuestion,
       result: this.active?.result ?? null
     };
