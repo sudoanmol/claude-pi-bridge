@@ -153,6 +153,7 @@ class CodexSession {
   async answer(questionId, answer) {
     const question = this.pendingQuestion;
     if (!question || !question.questions.some((entry) => entry.id === questionId)) throw new Error(`Unknown question: ${questionId}`);
+    if (question.kind === "async") return this.answerAsyncQuestion(question, questionId, answer);
     question.answers[questionId] = { answers: [answer] };
     const next = question.questions.find((entry) => !question.answers[entry.id]);
     if (next) {
@@ -168,6 +169,20 @@ class CodexSession {
     const result = await completion;
     if (result.status !== "question") this.active = null;
     return this.envelope(result);
+  }
+
+  async answerAsyncQuestion(question, questionId, answer) {
+    question.answers[questionId] = answer;
+    const next = question.questions.find((entry) => !question.answers[entry.id]);
+    if (next) {
+      question.id = next.id;
+      question.question = next;
+      return this.envelope({ status: "question", question });
+    }
+    this.pendingQuestion = null;
+    this.active = null;
+    const prompt = Object.entries(question.answers).map(([id, value]) => `${id}: ${value}`).join("\n");
+    return this.run(prompt, { include_commentary: question.includeCommentary });
   }
 
   async steer(message) {
@@ -228,7 +243,30 @@ class CodexSession {
     const active = this.active;
     if (!active) return;
     const turn = message.params?.turn ?? null;
-    const final = turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
+    const agentMessage = turn?.items?.find((item) => item.type === "agentMessage");
+    const asyncQuestions = agentMessage?.questions ?? [];
+    if (asyncQuestions.length) {
+      const questions = asyncQuestions.map((question, index) => ({
+        id: question.id ?? question.title ?? `question_${index + 1}`,
+        title: question.title ?? question.question ?? "Clarification",
+        options: question.options ?? []
+      }));
+      const pendingQuestion = {
+        kind: "async",
+        id: questions[0].id,
+        question: questions[0],
+        questions,
+        answers: {},
+        includeCommentary: active.includeCommentary,
+        sessionId: this.sessionId
+      };
+      this.pendingQuestion = pendingQuestion;
+      const result = { status: "question", question: pendingQuestion, response: null, turn: this.summarizeTurn(turn) };
+      if (active.resume) { active.resume.resolve(result); active.resume = null; }
+      else active.result = result;
+      return;
+    }
+    const final = agentMessage?.phase === "final_answer" ? agentMessage.text : turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
     const response = active.includeCommentary ? [...this.messages.values()].join("\n") : final ?? this.output;
     const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
     if (active.resume) { active.resume.resolve(result); active.resume = null; }

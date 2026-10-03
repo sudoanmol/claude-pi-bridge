@@ -43,6 +43,16 @@ Each finding gives what happened, the cause in this repository, and the fix. The
 
 **Status.** The bridge now uses Codex's `plan` collaboration mode for read-only ask and review sessions. A live `gpt-6-astra` test produced `item/tool/requestUserInput`; workspace-write tasks keep the normal collaboration mode.
 
+**Resolved.** In a later retest with `gpt-6.1-sol`/`medium` on Codex 0.160.0, the turn completed with `status: "completed"` and the question in plain text. The rollout log (`~/.codex/sessions/2026/10/02/rollout-2026-10-02T17-10-48-01a0ff19-….jsonl`) shows that in plan mode Codex called `request_user_input_async`, not `request_user_input`:
+
+1. Its first call failed with `unknown field 'question', expected 'title' or 'options'`.
+2. Its second call returned `{"accepted":true}`.
+3. Codex slept for 1 s and ended the turn.
+
+The async variant sends no server request. The question arrives on the `agentMessage` thread item as `questions: AsyncUserInputQuestion[]` (`{ title, options? }`, per `codex app-server generate-json-schema`), and Codex expects the answer as the next user turn. The bridge now detects that item and sends the answer as the next turn on the same thread.
+
+The synchronous handler remains in place because which question mechanism Codex uses depends on the model.
+
 ## 4. `codex_steer` cannot reach an active turn
 
 **Observed.** Each `codex_ask` blocked for 25–56 seconds and returned only after the turn completed. An agent that calls tools one at a time never has an active turn to steer.
@@ -80,6 +90,20 @@ Each finding gives what happened, the cause in this repository, and the fix. The
 - Results include `durationMs` but no token usage. This is acceptable for now; do not add a token-usage layer unless the app-server exposes a stable value that the agent experience needs.
 - The `model` and `effort` schema fields have no descriptions. Agents only find the valid values if they already know about `codex_models`.
 
+## Retest after fixes (2026-10-02, 17:10)
+
+| Finding | Result |
+| --- | --- |
+| 1. Session continuation | Fixed. The `session_id` stayed the same across turns, and Codex quoted its earlier question without being given it. |
+| 2. Model locked per session | Fixed. Passing `model: "gpt-6-astra"` on a `gpt-6.1-sol` session was rejected with "Start a new session to change model." Results report `model` and `effort`. |
+| 3. Structured clarification | Fixed. Both blocking requests and completed agent messages with async questions now reach `codex_answer`. |
+| 4. Steer an active turn | Fixed. `wait: false` returned `status: "started"`. `codex_steer` then changed the scope of the same turn ID, and Codex followed the correction. |
+| 5. Clean response | Fixed. `response` contains only the final answer, and `turn.item_ids` replaces the duplicated items. |
+| 6. Trimmed model list | Fixed. |
+| 7. Process cleanup | Fixed. `codex_close` returned `closed: true`, and no `codex app-server --listen stdio://` processes remained. |
+
+`codex_models` without a `session_id` now closes its temporary session before returning.
+
 ## Not yet exercised
 
-`codex_task`, `codex_review`, `codex_answer` against a live question, `codex_steer` against a live turn, and the `MAX_CLARIFICATIONS` fallback.
+`codex_task`, `codex_review`, and the `MAX_CLARIFICATIONS` fallback.

@@ -118,8 +118,16 @@ async function callTool(name, args = {}) {
   if (name === "codex_answer") return bridge.get(args.session_id).answer(args.question_id, args.answer);
   if (name === "codex_steer") return bridge.get(args.session_id).steer(args.message);
   if (name === "codex_models") {
-    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ cwd: args.cwd });
-    return { session_id: session.sessionId, models: session.models(args.verbose === true) };
+    if (args.session_id) {
+      const session = bridge.get(args.session_id);
+      return { session_id: session.sessionId, models: session.models(args.verbose === true) };
+    }
+    const session = await bridge.session({ cwd: args.cwd });
+    try {
+      return { models: session.models(args.verbose === true) };
+    } finally {
+      await bridge.closeSession(session.sessionId);
+    }
   }
   if (name === "codex_close") return bridge.closeSession(args.session_id);
   if (name === "codex_status") return bridge.get(args.session_id).status();

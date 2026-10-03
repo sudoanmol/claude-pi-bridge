@@ -38,6 +38,8 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     import readline from "node:readline";
     const input = readline.createInterface({ input: process.stdin });
     let questionSent = false;
+    let normalTurnSent = false;
+    let asyncQuestionSent = false;
     input.on("line", (line) => {
       const message = JSON.parse(line);
       const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
@@ -51,6 +53,17 @@ test("a Codex clarification can round-trip through the bridge", async () => {
           return setTimeout(() => send({ id: 90, method: "item/tool/requestUserInput", params: { questions: [{ id: "scope", question: "Which scope?" }, { id: "format", question: "Which format?" }] } }), 5);
         }
         send({ id: message.id, result: { turn: { id: "turn-1" } } });
+        if (!normalTurnSent) {
+          normalTurnSent = true;
+          return setTimeout(() => {
+            send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
+            send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
+          }, 5);
+        }
+        if (!asyncQuestionSent) {
+          asyncQuestionSent = true;
+          return setTimeout(() => send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed", items: [{ type: "agentMessage", id: "msg-question", phase: "final_answer", text: "What requirement should I use?", questions: [{ title: "Requirement", options: [{ label: "Objective" }, { label: "Constraint" }] }] }] } } }), 5);
+        }
         return setTimeout(() => {
           send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
           send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
@@ -87,7 +100,10 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     const status = session.status();
     assert.equal(status.active, false);
-    assert.equal(status.result.response, "READY");
+    assert.equal(status.pending_question.id, "Requirement");
+    const asyncAnswer = await session.answer("Requirement", "Objective");
+    assert.equal(asyncAnswer.status, "completed");
+    assert.equal(asyncAnswer.response, "READY");
   } finally {
     await bridge.close();
   }
