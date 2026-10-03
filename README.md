@@ -43,6 +43,8 @@ Set `wait: false` to return after Codex starts a turn. Use `codex_status` for pr
 
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 
+Read-only ask and review sessions use Codex's `plan` collaboration mode because that mode exposes structured clarification requests. Workspace-write tasks use Codex's normal collaboration mode.
+
 ## Claude Code shortcuts
 
 - `/codex-ask <question>` delegates a repository question.

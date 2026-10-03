@@ -41,6 +41,8 @@ Each finding gives what happened, the cause in this repository, and the fix. The
 - Add a live smoke test in which the prompt forces a clarification and the test asserts `status: "question"`.
 - Until that works, keep the README and tool descriptions accurate about what to expect.
 
+**Status.** The bridge now uses Codex's `plan` collaboration mode for read-only ask and review sessions. A live `gpt-6-astra` test produced `item/tool/requestUserInput`; workspace-write tasks keep the normal collaboration mode.
+
 ## 4. `codex_steer` cannot reach an active turn
 
 **Observed.** Each `codex_ask` blocked for 25–56 seconds and returned only after the turn completed. An agent that calls tools one at a time never has an active turn to steer.

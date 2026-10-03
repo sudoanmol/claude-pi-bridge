@@ -86,6 +86,12 @@ class CodexSession {
       "When a material requirement or repository fact is missing, use request_user_input to ask Claude for clarification instead of guessing.",
       "Keep clarification questions short and actionable. Do not ask the human directly."
     ].join(" ");
+    this.collaborationMode = this.mode === "task" ? "default" : "plan";
+    this.collaborationSettings = {
+      model: this.model,
+      reasoning_effort: this.effort,
+      developer_instructions: developerInstructions
+    };
     const thread = await this.client.request("thread/start", {
       cwd: this.cwd,
       model: this.model ?? null,
@@ -93,6 +99,7 @@ class CodexSession {
       approvalPolicy: "never",
       sandbox: this.mode === "task" ? "workspace-write" : "read-only",
       developerInstructions,
+      collaborationMode: { mode: this.collaborationMode, settings: this.collaborationSettings },
       threadSource: "cli"
     });
     this.threadId = thread.thread?.id;
@@ -129,7 +136,8 @@ class CodexSession {
         model: this.model,
         effort: this.effort,
         cwd: this.cwd,
-        sandboxPolicy: this.mode === "task" ? { type: "workspaceWrite", writableRoots: [this.cwd] } : { type: "readOnly" }
+        sandboxPolicy: this.mode === "task" ? { type: "workspaceWrite", writableRoots: [this.cwd] } : { type: "readOnly" },
+        collaborationMode: { mode: this.collaborationMode, settings: this.collaborationSettings }
       });
       this.active.turnId = started.turn?.id ?? null;
       if (!wait) return this.envelope({ status: "started", turn: this.summarizeTurn(started.turn ?? { id: this.active.turnId, status: "inProgress" }) });
