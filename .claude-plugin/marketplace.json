@@ -1,0 +1,13 @@
+{
+  "name": "local",
+  "owner": { "name": "Anmol Hurkat" },
+  "metadata": {
+    "description": "A local Claude Code bridge to Codex CLI with reviews, tasks, steering, and clarification exchange."
+  },
+  "plugins": [
+    {
+      "name": "codex-bridge",
+      "source": "./"
+    }
+  ]
+}

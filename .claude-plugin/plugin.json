@@ -1,5 +1,5 @@
 {
-  "name": "claude-codex-bridge",
+  "name": "codex-bridge",
   "version": "0.1.0",
   "description": "Bidirectional Claude Code and Codex app-server bridge",
   "author": { "name": "Anmol Hurkat" }

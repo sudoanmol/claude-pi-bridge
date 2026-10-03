@@ -18,6 +18,15 @@ Codex must be installed and authenticated before you use the tools:
 codex --version
 ```
 
+To install it permanently through the local marketplace, run these commands inside Claude Code:
+
+```text
+/plugin marketplace add /Users/anmolhurkat/Developer/claude-codex-bridge
+/plugin install codex-bridge@local
+```
+
+Restart Claude Code after installation. The marketplace manifest is `.claude-plugin/marketplace.json`.
+
 ## Claude-facing tools
 
 - `codex_ask` starts a read-only Codex conversation for repository questions.
