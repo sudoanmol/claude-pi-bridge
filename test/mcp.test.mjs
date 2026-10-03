@@ -65,7 +65,7 @@ test("a Codex clarification can round-trip through the bridge", async () => {
         }
         if (!asyncQuestionSent) {
           asyncQuestionSent = true;
-          return setTimeout(() => send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed", items: [{ type: "agentMessage", id: "msg-question", phase: "final_answer", text: "What requirement should I use?", questions: [{ title: "Requirement", options: [{ label: "Objective" }, { label: "Constraint" }] }] }] } } }), 5);
+          return setTimeout(() => send({ method: "item/completed", params: { item: { type: "agentMessage", id: "msg-question", phase: "commentary", text: "What requirement should I use?", questions: [{ title: "Requirement", options: [{ label: "Objective" }, { label: "Constraint" }] }] } } }), 5);
         }
         return setTimeout(() => {
           send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
@@ -76,7 +76,13 @@ test("a Codex clarification can round-trip through the bridge", async () => {
         send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
         return send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
       }
-      if (message.method === "turn/steer") return send({ id: message.id, result: {} });
+      if (message.method === "turn/steer") {
+        send({ id: message.id, result: {} });
+        return setTimeout(() => {
+          send({ method: "item/agentMessage/delta", params: { delta: "READY" } });
+          send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
+        }, 5);
+      }
     });
   `);
   await chmod(fake, 0o755);
@@ -105,11 +111,63 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     assert.equal(started.status, "started");
     await new Promise((resolve) => setTimeout(resolve, 20));
     const status = session.status();
-    assert.equal(status.active, false);
+    assert.equal(status.active, true);
     assert.equal(status.pending_question.id, "Requirement");
     const asyncAnswer = await session.answer("Requirement", "Objective");
     assert.equal(asyncAnswer.status, "completed");
     assert.equal(asyncAnswer.response, "READY");
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("an async clarification can be answered while its turn is still active", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "claude-codex-bridge-async-"));
+  const fake = path.join(dir, "fake-codex.mjs");
+  await writeFile(fake, `#!/usr/bin/env node
+    import readline from "node:readline";
+    const input = readline.createInterface({ input: process.stdin });
+    const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+    input.on("line", (line) => {
+      const message = JSON.parse(line);
+      if (message.method === "initialize") return send({ id: message.id, result: {} });
+      if (message.method === "model/list") return send({ id: message.id, result: { data: [{ model: "gpt-6-astra", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] } });
+      if (message.method === "thread/start") return send({ id: message.id, result: { thread: { id: "thread-async" } } });
+      if (message.method === "turn/start") {
+        send({ id: message.id, result: { turn: { id: "turn-async", status: "inProgress" } } });
+        return setTimeout(() => send({ method: "item/completed", params: { item: {
+          type: "agentMessage", id: "question-item", phase: "commentary", text: "Which requirement?",
+          questions: [{ title: "Requirement", options: [{ label: "Objective" }, { label: "Constraint" }] }]
+        } } }), 5);
+      }
+      if (message.method === "turn/steer") {
+        if (message.params.expectedTurnId !== "turn-async" || message.params.input?.[0]?.text !== "Requirement: Objective") {
+          return send({ id: message.id, error: { message: "wrong active turn or answer" } });
+        }
+        send({ id: message.id, result: {} });
+        return setTimeout(() => send({
+          method: "turn/completed",
+          params: { turn: { id: "turn-async", status: "completed", items: [{ type: "agentMessage", id: "answer-item", phase: "final_answer", text: "READY" }] } }
+        }), 5);
+      }
+    });
+  `);
+  await chmod(fake, 0o755);
+
+  const bridge = new Bridge({ appServerCommand: fake });
+  try {
+    const session = await bridge.session({ cwd: dir, model: "gpt-6-astra", effort: "high" });
+    const question = await session.ask("Ask me.");
+    assert.equal(question.status, "question");
+    assert.equal(question.question.id, "Requirement");
+    assert.equal(question.turn.id, "turn-async");
+    assert.equal(session.status().turn_id, "turn-async");
+    const answer = await session.answer("Requirement", "Objective");
+    assert.equal(answer.status, "completed");
+    assert.equal(answer.response, "READY");
+    const activity = session.status().activity;
+    assert.equal(activity.some((event) => event.source_type === "userMessage"), false);
+    assert.equal(activity.find((event) => event.item_id === "question-item").text, "Which requirement?");
   } finally {
     await bridge.close();
   }

@@ -50,6 +50,8 @@ Pass `model` and `effort` only when starting a session. The bridge validates the
 
 Set `wait: false` to return after Codex starts a turn. Poll `codex_status` with the last `activity_latest_seq` as `since` to receive only new commands, file changes, tool calls, and message snippets. Use `codex_steer` or `codex_answer` when the activity needs a correction.
 
+`wait: true` returns a question or completion as soon as one arrives and is capped at 100 seconds. A longer turn returns `status: "running"` with its `session_id`; continue with `codex_status`, `codex_steer`, or `codex_answer`.
+
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 
 Read-only ask and review sessions use Codex's `plan` collaboration mode because that mode exposes structured clarification requests. Workspace-write tasks use Codex's normal collaboration mode.

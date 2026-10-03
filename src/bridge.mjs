@@ -4,6 +4,7 @@ import { AppServerClient } from "./app-server-client.mjs";
 
 const MAX_CLARIFICATIONS = 3;
 const MAX_ACTIVITY = 200;
+const WAIT_TIMEOUT_MS = 100_000;
 
 export class Bridge {
   constructor({ appServerCommand } = {}) {
@@ -131,12 +132,10 @@ class CodexSession {
     this.clarifications = 0;
     this.output = "";
     this.messages = new Map();
-    this.messageActivity = new Map();
     this.activity = [];
     this.activitySeq = 0;
     this.running = null;
     this.active = { turnId: null, includeCommentary: include_commentary, startedAt: Date.now() };
-    const resultPromise = wait ? this.waitForActiveTurn() : null;
     try {
       const started = await this.client.request("turn/start", {
         threadId: this.threadId,
@@ -149,8 +148,8 @@ class CodexSession {
       });
       this.active.turnId = started.turn?.id ?? null;
       if (!wait) return this.envelope({ status: "started", turn: this.summarizeTurn(started.turn ?? { id: this.active.turnId, status: "inProgress" }) });
-      const result = await resultPromise;
-      if (result.status !== "question") this.active = null;
+      const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
+      if (result.status !== "question" && result.status !== "running") this.active = null;
       return this.envelope(result);
     } catch (error) {
       this.active = null;
@@ -170,12 +169,12 @@ class CodexSession {
       return this.envelope({ status: "question", question });
     }
     this.pendingQuestion = null;
-    const completion = this.waitForActiveTurn();
+    const completion = this.waitForActiveTurn(WAIT_TIMEOUT_MS);
     this.client.respond(question.rpcId, {
       answers: question.answers
     });
     const result = await completion;
-    if (result.status !== "question") this.active = null;
+    if (result.status !== "question" && result.status !== "running") this.active = null;
     return this.envelope(result);
   }
 
@@ -187,10 +186,19 @@ class CodexSession {
       question.question = next;
       return this.envelope({ status: "question", question });
     }
+    const active = this.active;
+    if (!active?.turnId || active.result) throw new Error("The Codex turn is no longer active; start a new turn.");
+    active.pause = null;
+    const answerText = Object.entries(question.answers).map(([id, value]) => `${id}: ${value}`).join("\n");
+    await this.client.request("turn/steer", {
+      threadId: this.threadId,
+      expectedTurnId: active.turnId,
+      input: [{ type: "text", text: answerText }]
+    });
     this.pendingQuestion = null;
-    this.active = null;
-    const prompt = Object.entries(question.answers).map(([id, value]) => `${id}: ${value}`).join("\n");
-    return this.run(prompt, { include_commentary: question.includeCommentary });
+    const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
+    if (result.status !== "question" && result.status !== "running") this.active = null;
+    return this.envelope(result);
   }
 
   async steer(message) {
@@ -201,12 +209,12 @@ class CodexSession {
       expectedTurnId: this.active.turnId,
       input: [{ type: "text", text: message }]
     });
-    const result = await this.waitForActiveTurn();
-    if (result.status !== "question") this.active = null;
+    const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
+    if (result.status !== "question" && result.status !== "running") this.active = null;
     return this.envelope(result);
   }
 
-  waitForActiveTurn() {
+  waitForActiveTurn(timeoutMs = null) {
     if (!this.active) throw new Error("No active Codex turn");
     if (this.active.result) {
       const result = this.active.result;
@@ -218,7 +226,16 @@ class CodexSession {
       this.active.pause = null;
       return Promise.resolve(result);
     }
-    return new Promise((resolve, reject) => { this.active.resume = { resolve, reject }; });
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject };
+      this.active.resume = waiter;
+      if (timeoutMs === null) return;
+      waiter.timer = setTimeout(() => {
+        if (this.active?.resume !== waiter) return;
+        this.active.resume = null;
+        resolve({ status: "running", turn: this.summarizeTurn({ id: this.active.turnId, status: "inProgress" }) });
+      }, timeoutMs);
+    });
   }
 
   handleServerRequest(message, client) {
@@ -237,7 +254,7 @@ class CodexSession {
     this.pendingQuestion = { id: question.id, rpcId: message.id, question, questions, answers: {}, sessionId: this.sessionId };
     const active = this.active;
     const result = { status: "question", question: this.pendingQuestion };
-    if (active?.resume) { active.resume.resolve(result); active.resume = null; }
+    if (active?.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
     else if (active) { active.pause = result; }
   }
 
@@ -252,15 +269,6 @@ class CodexSession {
       const delta = message.params?.delta ?? "";
       this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${delta}`);
       this.output += delta;
-      const state = this.messageActivity.get(itemId) ?? { pending: "", emittedAt: 0 };
-      state.pending += delta;
-      const now = Date.now();
-      if (now - state.emittedAt >= 500 || state.pending.length >= 160) {
-        this.recordActivity({ kind: "message", item_id: itemId, text: this.shortText(state.pending) });
-        state.pending = "";
-        state.emittedAt = now;
-      }
-      this.messageActivity.set(itemId, state);
     }
     if (message.method !== "turn/completed") return;
     const active = this.active;
@@ -268,44 +276,70 @@ class CodexSession {
     const turn = message.params?.turn ?? null;
     const agentMessage = turn?.items?.find((item) => item.type === "agentMessage");
     const asyncQuestions = agentMessage?.questions ?? [];
-    if (asyncQuestions.length) {
-      const questions = asyncQuestions.map((question, index) => ({
-        id: question.id ?? question.title ?? `question_${index + 1}`,
-        title: question.title ?? question.question ?? "Clarification",
-        options: question.options ?? []
-      }));
-      const pendingQuestion = {
-        kind: "async",
-        id: questions[0].id,
-        question: questions[0],
-        questions,
-        answers: {},
-        includeCommentary: active.includeCommentary,
-        sessionId: this.sessionId
-      };
-      this.pendingQuestion = pendingQuestion;
-      const result = { status: "question", question: pendingQuestion, response: null, turn: this.summarizeTurn(turn) };
-      if (active.resume) { active.resume.resolve(result); active.resume = null; }
-      else active.result = result;
-      return;
-    }
+    if (asyncQuestions.length && this.pendingQuestion?.item_id !== agentMessage?.id) return this.publishAsyncQuestion(asyncQuestions, active, agentMessage?.id, turn);
     const final = agentMessage?.phase === "final_answer" ? agentMessage.text : turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
     const response = active.includeCommentary ? [...this.messages.values()].join("\n") : final ?? this.output;
     const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
-    if (active.resume) { active.resume.resolve(result); active.resume = null; }
+    if (active.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
     else active.result = result;
   }
 
   handleItemStarted(params = {}) {
     const item = this.describeItem(params.item);
     this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
+    if (item.source_type === "userMessage") return;
     this.recordActivity({ phase: "started", ...item });
   }
 
   handleItemCompleted(params = {}) {
     const item = this.describeItem(params.item);
-    this.recordActivity({ phase: "completed", ...item });
+    if (item.source_type === "agentMessage" && params.item?.questions?.length && this.active) {
+      if (this.pendingQuestion?.item_id !== item.item_id) this.publishAsyncQuestion(params.item.questions, this.active, item.item_id);
+    }
+    if (item.source_type !== "userMessage") this.recordActivity({ phase: "completed", ...item });
     if (this.running?.item_id === item.item_id) this.running = null;
+  }
+
+  publishAsyncQuestion(rawQuestions, active, itemId = null, turn = null) {
+    const questions = this.normalizeQuestions(rawQuestions);
+    const pendingQuestion = {
+      kind: "async",
+      id: questions[0].id,
+      question: questions[0],
+      questions,
+      answers: {},
+      includeCommentary: active.includeCommentary,
+      item_id: itemId,
+      sessionId: this.sessionId
+    };
+    this.pendingQuestion = pendingQuestion;
+    const result = {
+      status: "question",
+      question: pendingQuestion,
+      response: null,
+      turn: this.summarizeTurn(turn ?? { id: active.turnId, status: "inProgress" })
+    };
+    if (active.resume) {
+      clearTimeout(active.resume.timer);
+      active.resume.resolve(result);
+      active.resume = null;
+    } else if (!active.result) active.pause = result;
+  }
+
+  normalizeQuestions(rawQuestions = []) {
+    const used = new Set();
+    return rawQuestions.map((question, index) => {
+      const base = String(question.id ?? question.title ?? question.question ?? `question_${index + 1}`);
+      let id = base;
+      let suffix = 2;
+      while (used.has(id)) id = `${base}_${suffix++}`;
+      used.add(id);
+      return {
+        id,
+        title: question.title ?? question.question ?? "Clarification",
+        options: question.options ?? []
+      };
+    });
   }
 
   describeItem(item = {}) {
@@ -313,7 +347,7 @@ class CodexSession {
     if (item.type === "commandExecution") return { ...base, kind: "command", command: this.shortText(item.command, 240), cwd: item.cwd ?? null, status: item.status ?? null, exit_code: item.exitCode ?? null };
     if (item.type === "fileChange") return { ...base, kind: "file_change", status: item.status ?? null, files: (item.changes ?? []).map((change) => change.path).filter(Boolean) };
     if (item.type === "mcpToolCall") return { ...base, kind: "mcp_tool", server: item.server ?? null, tool: item.tool ?? null, status: item.status ?? null };
-    if (item.type === "agentMessage") return { ...base, kind: "message", text: this.shortText(item.text) };
+    if (item.type === "agentMessage") return { ...base, kind: "message", text: this.shortText(this.messages.get(item.id) ?? item.text) };
     if (item.type === "plan") return { ...base, kind: "plan", text: this.shortText(item.text) };
     return base;
   }
@@ -348,7 +382,7 @@ class CodexSession {
     this.pendingQuestion = null;
     this.active = null;
     active?.reject?.(error);
-    active?.resume?.reject(error);
+    if (active?.resume) { clearTimeout(active.resume.timer); active.resume.reject(error); }
   }
 
   async loadModels() {

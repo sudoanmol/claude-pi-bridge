@@ -17,7 +17,7 @@ const tools = [
         model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
+        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
       },
       required: ["prompt"]
     }
@@ -34,7 +34,7 @@ const tools = [
         model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
+        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
       },
       required: ["prompt"]
     }
@@ -52,13 +52,13 @@ const tools = [
         model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
         include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for completion. Set false to steer or answer while Codex works." }
+        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
       }
     }
   },
   {
     name: "codex_answer",
-    description: "Answer a clarification question Codex asked during the current session.",
+    description: "Answer a clarification question Codex asked during the current session; async questions are steered into the active turn.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, question_id: { type: "string" }, answer: { type: "string" } },
