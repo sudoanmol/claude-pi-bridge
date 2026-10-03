@@ -112,8 +112,8 @@ test("a Codex clarification can round-trip through the bridge", async () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     const status = session.status();
     assert.equal(status.active, true);
-    assert.equal(status.pending_question.id, "Requirement");
-    const asyncAnswer = await session.answer("Requirement", "Objective");
+    assert.equal(status.pending_question.id, "q1");
+    const asyncAnswer = await session.answer("q1", "Objective");
     assert.equal(asyncAnswer.status, "completed");
     assert.equal(asyncAnswer.response, "READY");
   } finally {
@@ -141,7 +141,7 @@ test("an async clarification can be answered while its turn is still active", as
         } } }), 5);
       }
       if (message.method === "turn/steer") {
-        if (message.params.expectedTurnId !== "turn-async" || message.params.input?.[0]?.text !== "Requirement: Objective") {
+        if (message.params.expectedTurnId !== "turn-async" || message.params.input?.[0]?.text !== "q1: Objective") {
           return send({ id: message.id, error: { message: "wrong active turn or answer" } });
         }
         send({ id: message.id, result: {} });
@@ -159,10 +159,10 @@ test("an async clarification can be answered while its turn is still active", as
     const session = await bridge.session({ cwd: dir, model: "gpt-6-astra", effort: "high" });
     const question = await session.ask("Ask me.");
     assert.equal(question.status, "question");
-    assert.equal(question.question.id, "Requirement");
+    assert.equal(question.question.id, "q1");
     assert.equal(question.turn.id, "turn-async");
     assert.equal(session.status().turn_id, "turn-async");
-    const answer = await session.answer("Requirement", "Objective");
+    const answer = await session.answer("q1", "Objective");
     assert.equal(answer.status, "completed");
     assert.equal(answer.response, "READY");
     const activity = session.status().activity;

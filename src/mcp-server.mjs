@@ -61,7 +61,11 @@ const tools = [
     description: "Answer a clarification question Codex asked during the current session; async questions are steered into the active turn.",
     inputSchema: {
       type: "object",
-      properties: { session_id: { type: "string" }, question_id: { type: "string" }, answer: { type: "string" } },
+      properties: {
+        session_id: { type: "string" },
+        question_id: { type: "string", description: "Use the question.id returned by codex_ask or codex_status (for example, q1)." },
+        answer: { type: "string" }
+      },
       required: ["session_id", "question_id", "answer"]
     }
   },

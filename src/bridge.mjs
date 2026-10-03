@@ -329,7 +329,7 @@ class CodexSession {
   normalizeQuestions(rawQuestions = []) {
     const used = new Set();
     return rawQuestions.map((question, index) => {
-      const base = String(question.id ?? question.title ?? question.question ?? `question_${index + 1}`);
+      const base = question.id ? String(question.id) : `q${index + 1}`;
       let id = base;
       let suffix = 2;
       while (used.has(id)) id = `${base}_${suffix++}`;

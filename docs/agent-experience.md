@@ -152,6 +152,21 @@ The `wait: true` call also ran past Claude Code's 120 s MCP limit and was moved 
 - folds streamed message deltas into the completed agent-message entry;
 - skips `userMessage` start and completion entries.
 
+## Retest at 17:41: async questions answered inside the active turn
+
+Setup: Codex 0.160.0, `gpt-6.1-sol`/`medium`, and a bridge server restarted after `ceac0ee`. The prompt was the same as in the 17:26 retest, started with `wait: false`.
+
+**Observed.** Session `29a9c390…`, turn `01a0ff34-ead2-…`.
+
+1. `codex_ask` returned `status: "started"` with the `session_id` right away.
+2. Ten seconds later, `codex_status` showed `active: true`. `pending_question` held the async question with its four options, about 2 s after Codex asked it.
+3. `codex_answer` with "Command reconciliation" went into the same turn ID. Codex answered with file:line citations, and the turn completed in 64 s total.
+4. `codex_close` returned `closed: true`.
+
+The activity log no longer has single-character delta entries or user-message echoes.
+
+**Resolved.** When Codex omits a question ID, the bridge assigns a short stable ID such as `q1` (and exposes it in `codex_ask` and `codex_status`). Claude can pass that ID directly to `codex_answer` without copying the question title.
+
 ## Not yet exercised
 
 `codex_task`, `codex_review`, and the `MAX_CLARIFICATIONS` fallback.
