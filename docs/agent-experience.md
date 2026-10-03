@@ -167,6 +167,61 @@ The activity log no longer has single-character delta entries or user-message ec
 
 **Resolved.** When Codex omits a question ID, the bridge assigns a short stable ID such as `q1` (and exposes it in `codex_ask` and `codex_status`). Claude can pass that ID directly to `codex_answer` without copying the question title.
 
+## Retest at 17:45: `codex_task` and `codex_review` on a scratch repository
+
+Setup: a throwaway git repository holding `slug.py` with a broken `slugify` and assert-based checks, `gpt-6.1-sol`/`low`, and `wait: false` for both tools.
+
+**`codex_task` works.** Session `90c06389…`.
+
+1. Ten seconds in, `codex_status` showed Codex's plan, its first command with exit code 0, and its next step.
+2. Claude steered with an extra requirement: `slugify("!!!") == ""` and no edge hyphens. The steer went into the same turn ID.
+3. The final diff applied both the original fix and the steer. Claude ran `python3 slug.py` independently, and it printed `ok`. The turn took 98 s.
+
+**`codex_review` works.** Session `2b253092…`.
+
+1. Codex asked a blocking `request_user_input` question with a proper ID, `slug_contract`, a header, and labeled options.
+2. Claude answered it with `codex_answer`.
+3. Codex returned one finding with a reproducing input: `slugify("hello_world")` keeps the underscore. Claude confirmed it independently.
+
+Both sessions closed cleanly.
+
+## 10. No way to wait on a running turn
+
+**Observed.** After `wait: false`, Claude has only two ways to learn that something changed:
+
+- Poll `codex_status` repeatedly. Claude Code blocks standalone `sleep` between polls, so Claude polls back to back. During the review, four polls in about 20 s each returned almost the same payload.
+- Call `codex_steer`, which waits for the next question or for completion. During the review, Claude sent a reminder through `codex_steer` partly so it could wait on the turn. That works, but it is a side effect, and a caller should not have to change Codex's instructions just to wait.
+
+**Fix.** Add `codex_wait({ session_id, since, timeout_ms })`, or a `wait_ms` option on `codex_status`. It returns as soon as there is new activity after `since`, a pending question, or a completed turn. Otherwise it returns `status: "running"` at the timeout. Cap the timeout below the client's MCP tool limit, for example at 90 s, so the caller keeps control. The supervision loop then becomes: start with `wait: false`, call `codex_wait` repeatedly, and steer or answer when needed. The loop never busy-polls and never blocks past the client limit.
+
+**Implemented.** `codex_wait` waits for new or updated activity, a pending question, or a completed turn. It returns `status: "running"` at timeout and caps `timeout_ms` at 90 seconds. The existing `since` cursor remains available on `codex_status`. Restart Claude Code after installing a new plugin version so it reloads the MCP tool list.
+
+## 11. `codex_status` resends the whole activity log every time
+
+**Observed.** Every poll returned the full log, about 5k tokens by seq 18. The cost grows with each event, multiplied by the number of polls.
+
+The bridge source supports `since` (`src/mcp-server.mjs:103`, `src/bridge.mjs:416`). The bridge server started at 17:40, after `mcp-server.mjs` last changed at 17:35. Even so, Claude Code still offered the earlier `codex_status` definition, with only a `session_id` property, so Claude could not pass `since`. Claude Code appears to keep tool definitions from an earlier connection. Check whether `/mcp` reconnect refreshes `tools/list`. If it does not, document that a full Claude Code restart is required after changing a tool definition.
+
+The log is also larger than it needs to be:
+
+- Every item appears twice, once when it starts and once when it completes. Both entries repeat the full `command` and `cwd`.
+- Each `command_output` entry is a separate line.
+
+**Fix.**
+
+- Make `since` the documented default way to poll.
+- Keep one entry per item and update it in place when the item completes.
+- Already-reported in-progress items can rely on `running`.
+- Leave out `cwd` when it equals the session's `cwd`.
+- Fold command output into its command entry as a short tail.
+
+**Implemented.** Activity keeps one entry per item. A completion updates the item and receives a new sequence number, so a caller that already saw the start receives the completion on its next `since` poll. Command output is kept as a bounded tail, and the session working directory is omitted from command entries.
+
+## 12. Smaller items from this retest
+
+- Read-only sessions on macOS show `git: error: couldn't create cache file '/tmp/xcrun_db-…' (errno=Operation not permitted)`. One `git status` returned exit 1 even though it printed output. The read-only sandbox blocks `xcrun`'s cache write to `/tmp`, so Codex may misread git failures during reviews. Setting `TMPDIR` to a writable sandbox path might help; this has not been tested.
+- Blocking questions carry their own ID, for example `slug_contract`. Async questions without an ID receive a generated short ID such as `q1`, so both paths give Claude a compact value for `codex_answer`.
+
 ## Not yet exercised
 
-`codex_task`, `codex_review`, and the `MAX_CLARIFICATIONS` fallback.
+The `MAX_CLARIFICATIONS` fallback, and `codex_review` with `base`.

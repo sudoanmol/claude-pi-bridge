@@ -25,8 +25,13 @@ test("MCP server advertises the bidirectional Codex tools", async () => {
     "codex_steer",
     "codex_models",
     "codex_close",
+    "codex_wait",
     "codex_status"
   ]);
+  const waitTool = listing.result.tools.find((tool) => tool.name === "codex_wait");
+  assert.deepEqual(waitTool.inputSchema.required, ["session_id", "since"]);
+  assert.equal(waitTool.inputSchema.properties.timeout_ms.maximum, 90000);
+  assert.ok(listing.result.tools.find((tool) => tool.name === "codex_status").inputSchema.properties.since);
   child.kill("SIGTERM");
   await once(child, "exit");
 });
@@ -226,6 +231,10 @@ test("MCP continuation keeps the supplied session", async () => {
     assert.equal(JSON.parse(continuation.result.content[0].text).status, "completed");
     const status = await request(5, "tools/call", { name: "codex_status", arguments: { session_id: firstValue.session_id } });
     assert.equal(JSON.parse(status.result.content[0].text).thread_id, "thread-1");
+    const waited = await request(6, "tools/call", { name: "codex_wait", arguments: { session_id: firstValue.session_id, since: 0, timeout_ms: 0 } });
+    const value = JSON.parse(waited.result.content[0].text);
+    assert.equal(value.status, "completed");
+    assert.equal(value.result.response, "READY");
   } finally {
     child.kill("SIGTERM");
     await once(child, "exit");

@@ -96,8 +96,21 @@ const tools = [
     }
   },
   {
+    name: "codex_wait",
+    description: "Wait for new Codex activity, a clarification question, or completion without sending instructions. After wait:false, call repeatedly with the last activity_latest_seq as since.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        since: { type: "integer", minimum: 0, description: "Last activity_latest_seq received; use 0 for the first wait. Updated items get new sequence numbers." },
+        timeout_ms: { type: "integer", minimum: 0, maximum: 90000, default: 90000, description: "Maximum wait in milliseconds. Returns running at timeout; capped at 90 seconds." }
+      },
+      required: ["session_id", "since"]
+    }
+  },
+  {
     name: "codex_status",
-    description: "Poll Codex progress, commands, file changes, tool calls, and pending clarification questions. Pass since to receive only new activity.",
+    description: "Read Codex progress immediately. Pass the last activity_latest_seq as since for only new or updated items. Prefer codex_wait between updates to avoid busy polling.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, since: { type: "integer", minimum: 0, description: "Return activity events after this sequence number." } },
@@ -134,6 +147,7 @@ async function callTool(name, args = {}) {
     }
   }
   if (name === "codex_close") return bridge.closeSession(args.session_id);
+  if (name === "codex_wait") return bridge.get(args.session_id).wait(args.since, args.timeout_ms);
   if (name === "codex_status") return bridge.get(args.session_id).status(args.since ?? 0);
   throw new Error(`Unknown tool: ${name}`);
 }

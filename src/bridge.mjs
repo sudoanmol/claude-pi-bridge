@@ -5,6 +5,7 @@ import { AppServerClient } from "./app-server-client.mjs";
 const MAX_CLARIFICATIONS = 3;
 const MAX_ACTIVITY = 200;
 const WAIT_TIMEOUT_MS = 100_000;
+const WAIT_TOOL_TIMEOUT_MS = 90_000;
 
 export class Bridge {
   constructor({ appServerCommand } = {}) {
@@ -64,6 +65,9 @@ class CodexSession {
     this.active = null;
     this.activity = [];
     this.activitySeq = 0;
+    this.activityEvictedThrough = 0;
+    this.lastResult = null;
+    this.waiters = new Set();
     this.running = null;
   }
 
@@ -133,7 +137,9 @@ class CodexSession {
     this.output = "";
     this.messages = new Map();
     this.activity = [];
-    this.activitySeq = 0;
+    this.activityEvictedThrough = this.activitySeq;
+    this.lastResult = null;
+    this.pendingQuestion = null;
     this.running = null;
     this.active = { turnId: null, includeCommentary: include_commentary, startedAt: Date.now() };
     try {
@@ -169,6 +175,7 @@ class CodexSession {
       return this.envelope({ status: "question", question });
     }
     this.pendingQuestion = null;
+    this.active.pause = null;
     const completion = this.waitForActiveTurn(WAIT_TIMEOUT_MS);
     this.client.respond(question.rpcId, {
       answers: question.answers
@@ -256,19 +263,26 @@ class CodexSession {
     const result = { status: "question", question: this.pendingQuestion };
     if (active?.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
     else if (active) { active.pause = result; }
+    this.notifyWaiters();
   }
 
   handleNotification(message) {
     if (message.method === "item/started") return this.handleItemStarted(message.params);
     if (message.method === "item/completed") return this.handleItemCompleted(message.params);
-    if (message.method === "item/commandExecution/outputDelta") return this.recordActivity({ kind: "command_output", item_id: message.params?.itemId, text: this.shortText(message.params?.delta) });
-    if (message.method === "item/mcpToolCall/progress") return this.recordActivity({ kind: "mcp_progress", item_id: message.params?.itemId, text: this.shortText(message.params?.message) });
     if (message.method === "turn/plan/updated") return this.recordActivity({ kind: "plan", text: this.shortText(message.params?.explanation ?? message.params?.plan?.map((step) => step.step ?? step).join("; ")) });
     if (message.method === "item/agentMessage/delta") {
       const itemId = message.params?.itemId ?? "default";
       const delta = message.params?.delta ?? "";
       this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${delta}`);
       this.output += delta;
+    }
+    if (message.method === "item/commandExecution/outputDelta") {
+      this.appendActivity(message.params?.itemId, "output_tail", message.params?.delta);
+      return;
+    }
+    if (message.method === "item/mcpToolCall/progress") {
+      this.appendActivity(message.params?.itemId, "progress_tail", message.params?.message);
+      return;
     }
     if (message.method !== "turn/completed") return;
     const active = this.active;
@@ -280,24 +294,27 @@ class CodexSession {
     const final = agentMessage?.phase === "final_answer" ? agentMessage.text : turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
     const response = active.includeCommentary ? [...this.messages.values()].join("\n") : final ?? this.output;
     const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
+    this.lastResult = result;
+    this.running = null;
     if (active.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
     else active.result = result;
+    this.notifyWaiters();
   }
 
   handleItemStarted(params = {}) {
     const item = this.describeItem(params.item);
-    this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
     if (item.source_type === "userMessage") return;
-    this.recordActivity({ phase: "started", ...item });
+    this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
+    this.recordActivity({ phase: "started", ...item }, item.item_id);
   }
 
   handleItemCompleted(params = {}) {
     const item = this.describeItem(params.item);
+    if (this.running?.item_id === item.item_id) this.running = null;
     if (item.source_type === "agentMessage" && params.item?.questions?.length && this.active) {
       if (this.pendingQuestion?.item_id !== item.item_id) this.publishAsyncQuestion(params.item.questions, this.active, item.item_id);
     }
-    if (item.source_type !== "userMessage") this.recordActivity({ phase: "completed", ...item });
-    if (this.running?.item_id === item.item_id) this.running = null;
+    if (item.source_type !== "userMessage") this.recordActivity({ phase: "completed", ...item }, item.item_id);
   }
 
   publishAsyncQuestion(rawQuestions, active, itemId = null, turn = null) {
@@ -324,6 +341,7 @@ class CodexSession {
       active.resume.resolve(result);
       active.resume = null;
     } else if (!active.result) active.pause = result;
+    this.notifyWaiters();
   }
 
   normalizeQuestions(rawQuestions = []) {
@@ -344,7 +362,7 @@ class CodexSession {
 
   describeItem(item = {}) {
     const base = { item_id: item.id ?? null, source_type: item.type ?? "unknown" };
-    if (item.type === "commandExecution") return { ...base, kind: "command", command: this.shortText(item.command, 240), cwd: item.cwd ?? null, status: item.status ?? null, exit_code: item.exitCode ?? null };
+    if (item.type === "commandExecution") return { ...base, kind: "command", command: this.shortText(item.command, 240), ...(item.cwd && path.resolve(item.cwd) !== this.cwd ? { cwd: item.cwd } : {}), status: item.status ?? null, exit_code: item.exitCode ?? null };
     if (item.type === "fileChange") return { ...base, kind: "file_change", status: item.status ?? null, files: (item.changes ?? []).map((change) => change.path).filter(Boolean) };
     if (item.type === "mcpToolCall") return { ...base, kind: "mcp_tool", server: item.server ?? null, tool: item.tool ?? null, status: item.status ?? null };
     if (item.type === "agentMessage") return { ...base, kind: "message", text: this.shortText(this.messages.get(item.id) ?? item.text) };
@@ -358,10 +376,58 @@ class CodexSession {
     return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
   }
 
-  recordActivity(event) {
-    const entry = { seq: ++this.activitySeq, at: Date.now(), ...event };
+  recordActivity(event, itemId = null) {
+    const index = itemId ? this.activity.findIndex((entry) => entry.item_id === itemId) : -1;
+    const previous = index >= 0 ? this.activity.splice(index, 1)[0] : {};
+    const entry = { ...previous, ...event, seq: ++this.activitySeq, at: Date.now() };
     this.activity.push(entry);
-    if (this.activity.length > MAX_ACTIVITY) this.activity.shift();
+    if (this.activity.length > MAX_ACTIVITY) {
+      this.activityEvictedThrough = this.activity.shift().seq;
+    }
+    this.notifyWaiters();
+  }
+
+  appendActivity(itemId, field, value) {
+    if (!itemId || !value) return;
+    const entry = this.activity.find((event) => event.item_id === itemId);
+    const tail = `${entry?.[field] ?? ""}${value}`.slice(-240);
+    this.recordActivity({ item_id: itemId, [field]: tail }, itemId);
+  }
+
+  wait(since = this.activitySeq, timeoutMs = WAIT_TOOL_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(since) || since < 0) throw new Error("since must be a non-negative integer");
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error("timeout_ms must be a non-negative integer");
+    if (this.failure) return Promise.reject(this.failure);
+    const snapshot = this.status(since);
+    const reason = this.waitReason(snapshot);
+    if (reason) return Promise.resolve({ ...snapshot, status: reason });
+    return new Promise((resolve, reject) => {
+      const waiter = { since, resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this.waiters.delete(waiter);
+        resolve({ ...this.status(since), status: "running" });
+      }, Math.min(timeoutMs, WAIT_TOOL_TIMEOUT_MS));
+      this.waiters.add(waiter);
+    });
+  }
+
+  waitReason(snapshot) {
+    if (snapshot.pending_question) return "question";
+    if (snapshot.result) return snapshot.result.status ?? "completed";
+    if (!snapshot.active) return "idle";
+    if (snapshot.activity.length) return "updated";
+    return null;
+  }
+
+  notifyWaiters() {
+    for (const waiter of this.waiters) {
+      const snapshot = this.status(waiter.since);
+      const reason = this.waitReason(snapshot);
+      if (!reason) continue;
+      this.waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      waiter.resolve({ ...snapshot, status: reason });
+    }
   }
 
   summarizeTurn(turn) {
@@ -378,10 +444,15 @@ class CodexSession {
   }
 
   handleFailure(error) {
+    this.failure = error;
     const active = this.active;
     this.pendingQuestion = null;
     this.active = null;
-    active?.reject?.(error);
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.waiters.clear();
     if (active?.resume) { clearTimeout(active.resume.timer); active.resume.reject(error); }
   }
 
@@ -414,7 +485,6 @@ class CodexSession {
   }
 
   status(since = 0) {
-    const firstSeq = this.activity[0]?.seq ?? this.activitySeq + 1;
     return {
       session_id: this.sessionId,
       thread_id: this.threadId,
@@ -428,9 +498,9 @@ class CodexSession {
       running: this.running ? { ...this.running, elapsed_ms: Math.max(0, Date.now() - this.running.started_at) } : null,
       activity: this.activity.filter((event) => event.seq > since),
       activity_latest_seq: this.activitySeq,
-      activity_truncated: since < firstSeq - 1,
+      activity_truncated: since < this.activityEvictedThrough,
       pending_question: this.pendingQuestion,
-      result: this.active?.result ?? null
+      result: this.active?.result ?? this.lastResult
     };
   }
 
@@ -445,5 +515,8 @@ class CodexSession {
     }));
   }
 
-  async close() { await this.client?.close(); }
+  async close() {
+    this.handleFailure(new Error("Codex session closed"));
+    await this.client?.close();
+  }
 }

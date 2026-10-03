@@ -34,6 +34,7 @@ Restart Claude Code after installation. The marketplace manifest is `.claude-plu
 - `codex_review` starts a read-only review of uncommitted changes or a base revision.
 - `codex_models` lists available models and each model's supported reasoning efforts.
 - `codex_steer` sends feedback while a Codex turn is active.
+- `codex_wait` waits for new activity, a clarification, or completion without sending Codex a message.
 - `codex_answer` answers a question that Codex sends back.
 - `codex_status` shows the thread, progress, model, effort, and any pending question.
 - `codex_close` closes a session and its local app-server process.
@@ -48,9 +49,11 @@ Pass `model` and `effort` only when starting a session. The bridge validates the
 4. Claude can send corrections or review feedback with `codex_steer` while Codex is working.
 5. Codex returns `status: "completed"` with its response and turn metadata.
 
-Set `wait: false` to return after Codex starts a turn. Poll `codex_status` with the last `activity_latest_seq` as `since` to receive only new commands, file changes, tool calls, and message snippets. Use `codex_steer` or `codex_answer` when the activity needs a correction.
+Set `wait: false` to return after Codex starts a turn. Call `codex_wait` with the last `activity_latest_seq` as `since` to wait for new commands, file changes, tool calls, questions, or completion. Use `codex_status` for an immediate snapshot, and use `codex_steer` or `codex_answer` when the activity needs a correction.
 
 `wait: true` returns a question or completion as soon as one arrives and is capped at 100 seconds. A longer turn returns `status: "running"` with its `session_id`; continue with `codex_status`, `codex_steer`, or `codex_answer`.
+
+`codex_wait` is capped at 90 seconds. Pass the last `activity_latest_seq` as `since`; updated activity items receive a new sequence number. Restart Claude Code after installing a new plugin version so it reloads the MCP tool definitions.
 
 The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
 
