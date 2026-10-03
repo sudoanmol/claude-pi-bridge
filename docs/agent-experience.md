@@ -266,3 +266,5 @@ The `MAX_CLARIFICATIONS` fallback, and `codex_review` with `base`.
 ```
 
 **MCP config.** `.mcp.json` at the repository root also served as project-scope MCP config. When Claude Code opened this repository as a project, it started that server without `CLAUDE_PLUGIN_ROOT` set, and the server failed with `CONNECTION_CLOSED`. The server is now declared in `.claude-plugin/plugin.json`, and `.mcp.json` has been removed.
+
+**Cause of finding 11.** After a full Claude Code restart, the bridge server ran from the repository at `66c4059`. A direct `tools/list` request to `src/mcp-server.mjs` returned the new definitions, including `since` on `codex_status`. The resumed conversation still received the old `codex_status` and `codex_wait` definitions. Claude Code appears to keep MCP tool definitions per conversation once they are loaded, even across restarts. A tool that did not exist before, such as `codex_wait`, gets its current definition. To test a changed definition, start a new conversation instead of resuming one.
