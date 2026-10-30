@@ -40,9 +40,23 @@ Restart Claude Code after installing or updating, and start a new conversation: 
 | `pi_wait` | Wait on one or more sessions; returns when any has a question, a result, a failure, or new activity. |
 | `pi_status` | Snapshot of one session, or of all sessions when `session_id` is omitted. |
 | `pi_kill` | Abort the running turn, stop the pi process so it spends no more tokens, and remove a clean worktree. |
+| `pi_limits` | ChatGPT plan, 5-hour and weekly Codex usage with reset times, unavailable models, and what the plan allows. |
 | `pi_models` | Search model names; returns pi's default model and the thinking levels. |
 
 `model` (`provider/id`, for example `deepseek/deepseek-flash`), `thinking`, `cwd`, and `name` apply when a session starts and stay fixed for it. pi maps a thinking level the model does not support to a nearby one, so every result reports the level in use. Results also report the session's cumulative `cost_usd` and pi's `session_file`, which `pi --session <path>` reopens.
+
+## Choosing a model
+
+The MCP server's `instructions`, which Claude Code loads with the tools, tell Claude which model to pick:
+
+| Model | Use | Thinking |
+| --- | --- | --- |
+| `deepseek/deepseek-flash` | Fastest and cheapest; default for parallel workers and routine work | low, high, max |
+| `openai-codex/gpt-6.1-terra` | Most cost-efficient Codex model | low through max |
+| `openai-codex/gpt-6.1-sol` | Cost-efficient and highly capable; pi's default | Plus: low, medium, high |
+| `openai-codex/gpt-6-astra` | Most capable, very costly; hardest problems only | Never on Plus |
+
+The bridge enforces the Plus rules. After pi starts a Codex session, the bridge reads the plan from pi's Codex sign-in (`pi auth print-bearer-token`) and kills the session if the model or the thinking level pi settled on is not allowed. Other plans have no restrictions. `pi_limits` reads the same sign-in and calls ChatGPT's usage endpoint, so Claude can switch to DeepSeek before a Codex limit fails a turn. The token never leaves the bridge process except to `chatgpt.com`. The plan is read once per bridge process, so restart Claude Code after changing plans.
 
 ## The conversation loop
 

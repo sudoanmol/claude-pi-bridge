@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 // Minimal pi RPC stand-in. Prompt keywords pick the behavior: ASK, SELECT, SLOW, FAIL, ARGS.
+// `auth print-bearer-token` prints a fake Codex token for the plan in FAKE_PLAN.
 import { readLines } from "../src/pi-client.mjs";
 
 const args = process.argv.slice(2);
+if (args[0] === "auth") {
+  if (!process.env.FAKE_PLAN) process.exit(1);
+  const claims = { "https://api.openai.com/auth": { chatgpt_account_id: "acct", chatgpt_plan_type: process.env.FAKE_PLAN } };
+  console.log(`h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`);
+  process.exit(0);
+}
 const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
 const model = flag("--model") ?? "fake/default";
 if (model === "bogus/nope") {

@@ -8,6 +8,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/bridge.mjs";
+import { summarizeUsage } from "../src/codex.mjs";
 import { readLines } from "../src/pi-client.mjs";
 
 const command = fileURLToPath(new URL("./fake-pi.mjs", import.meta.url));
@@ -40,8 +41,9 @@ test("MCP server lists the pi tools", async () => {
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
   for (let i = 0; i < 100 && messages.length < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(messages[1].result.tools.map((tool) => tool.name), [
-    "pi_ask", "pi_review", "pi_task", "pi_answer", "pi_steer", "pi_wait", "pi_status", "pi_kill", "pi_models"
+    "pi_ask", "pi_review", "pi_task", "pi_answer", "pi_steer", "pi_wait", "pi_status", "pi_kill", "pi_limits", "pi_models"
   ]);
+  assert.match(messages[0].result.instructions, /deepseek\/deepseek-flash/);
   child.stdin.end();
   await once(child, "exit");
 });
@@ -265,4 +267,48 @@ test("a failed dependency install fails the turn with the installer's output", a
 test("worktree outside a git repository is a clear error", async () => {
   const bridge = new Bridge({ command });
   await assert.rejects(bridge.open({ cwd: os.tmpdir(), worktree: true }, "task"), /needs a git repository/);
+});
+
+test("the ChatGPT plan limits which Codex models and thinking levels a session may use", async () => {
+  const bridge = new Bridge({ command });
+  try {
+    process.env.FAKE_PLAN = "plus";
+    await assert.rejects(bridge.open({ model: "openai-codex/gpt-6-astra", thinking: "low" }, "ask"), /not allowed on the ChatGPT plus plan/);
+    await assert.rejects(bridge.open({ model: "openai-codex/gpt-6.1-sol", thinking: "xhigh" }, "ask"), /allows thinking low, medium, high/);
+    await bridge.open({ model: "openai-codex/gpt-6.1-sol", thinking: "high" }, "ask");
+    await bridge.open({ model: "openai-codex/gpt-6.1-terra", thinking: "max" }, "ask");
+    await bridge.open({ model: "deepseek/deepseek-flash", thinking: "max" }, "ask");
+    assert.equal(bridge.status().sessions.length, 3);
+
+    const pro = new Bridge({ command });
+    process.env.FAKE_PLAN = "pro";
+    await (await pro.open({ model: "openai-codex/gpt-6-astra", thinking: "max" }, "ask")).kill();
+
+    const signedOut = new Bridge({ command });
+    delete process.env.FAKE_PLAN;
+    await (await signedOut.open({ model: "openai-codex/gpt-6-astra", thinking: "max" }, "ask")).kill();
+  } finally {
+    delete process.env.FAKE_PLAN;
+    await bridge.close();
+  }
+});
+
+test("usage summary reports plan, windows, unavailable models, and allowed models", () => {
+  const summary = summarizeUsage({
+    plan_type: "plus",
+    rate_limit: {
+      limit_reached: true,
+      primary_window: { used_percent: 100, reset_after_seconds: 7092, reset_at: 1793337671 },
+      secondary_window: { used_percent: 35, reset_after_seconds: 444562, reset_at: 1793775142 }
+    },
+    model_usage: { "gpt-6-astra": { available: false, available_at: "2026-10-30T05:21:12Z" }, "gpt-6.1-sol": { available: true } },
+    credits: { has_credits: false, balance: "0" }
+  });
+  assert.equal(summary.plan, "plus");
+  assert.equal(summary.limit_reached, true);
+  assert.deepEqual(summary.windows.map((window) => [window.window, window.used_percent, window.resets_in_minutes]), [["5h", 100, 119], ["week", 35, 7410]]);
+  assert.equal(summary.windows[0].resets_at, new Date(1793337671 * 1000).toISOString());
+  assert.deepEqual(Object.keys(summary.unavailable_models), ["gpt-6-astra"]);
+  assert.equal(summary.allowed_models["openai-codex/gpt-6-astra"], "not allowed");
+  assert.equal(summarizeUsage({ plan_type: "pro" }).allowed_models, "All Codex models and thinking levels.");
 });

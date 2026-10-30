@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Bridge, THINKING_LEVELS } from "./bridge.mjs";
+import { codexLimits, MODEL_GUIDE } from "./codex.mjs";
 import { readLines } from "./pi-client.mjs";
 
 const bridge = new Bridge();
@@ -7,7 +8,7 @@ const bridge = new Bridge();
 const sessionProperties = {
   session_id: { type: "string", description: "Continue this session. Omit to start a new one." },
   cwd: { type: "string", description: "Working directory for a new session; defaults to the bridge's working directory." },
-  model: { type: "string", description: "provider/id for a new session, for example deepseek/deepseek-flash. Use pi_models to search. Defaults to pi's configured model." },
+  model: { type: "string", description: "provider/id for a new session; see the pi server instructions for which model to pick. Defaults to pi's configured model, openai-codex/gpt-6.1-sol." },
   thinking: { type: "string", enum: THINKING_LEVELS, description: "Thinking level for a new session. pi maps unsupported levels to a nearby one; the result reports the level in use." },
   name: { type: "string", description: "Label for a new session, shown in pi_status and pi's session list." },
   wait: { type: "boolean", description: "Wait up to 100 seconds for a question or completion (default true). Set false to start the turn and supervise with pi_wait, for example when running sessions in parallel." }
@@ -95,6 +96,11 @@ const tools = [
     inputSchema: { type: "object", properties: { session_id: { type: "string" } }, required: ["session_id"] }
   },
   {
+    name: "pi_limits",
+    description: "Read the ChatGPT plan behind pi's Codex models: plan name, 5-hour and weekly usage with reset times, models that are temporarily unavailable, and the models and thinking levels this plan allows. Check before starting Codex work.",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
     name: "pi_models",
     description: "Search the models pi can use. Returns provider/id names, pi's default model, and the thinking levels.",
     inputSchema: {
@@ -115,9 +121,14 @@ async function callTool(name, args = {}) {
   if (name === "pi_wait") return bridge.wait(args.sessions, args.timeout_ms);
   if (name === "pi_status") return bridge.status(args.session_id, args.since ?? 0);
   if (name === "pi_kill") return bridge.kill(args.session_id);
+  if (name === "pi_limits") return codexLimits();
   if (name === "pi_models") return bridge.models(args.search);
   throw new Error(`Unknown tool: ${name}`);
 }
+
+const instructions = `pi is a second coding agent. Use pi_ask for a second opinion, pi_review to have it review your work, and pi_task to delegate changes, including parallel workers in their own worktrees. pi can ask you questions mid-turn; answer them with pi_answer. Kill sessions with pi_kill once you no longer need them.
+
+${MODEL_GUIDE}`;
 
 const write = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 
@@ -128,7 +139,7 @@ readLines(process.stdin, async (line) => {
   if (message.method === "initialize") {
     return write({
       id: message.id,
-      result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "claude-pi-bridge", version: "0.2.0" } }
+      result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "claude-pi-bridge", version: "0.2.0" }, instructions }
     });
   }
   try {

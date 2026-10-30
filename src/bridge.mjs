@@ -2,6 +2,7 @@ import { access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertAllowed, CODEX_PROVIDER, codexPlan } from "./codex.mjs";
 import { PiClient } from "./pi-client.mjs";
 import { createWorktree, install, installCommands, removeWorktree } from "./worktree.mjs";
 
@@ -47,12 +48,24 @@ export class Bridge {
     const session = new PiSession({ id: `p${this.nextId++}`, mode, cwd: tree?.path ?? path.resolve(cwd), name, worktree: tree, command: this.command });
     try {
       await session.start({ model, thinking });
+      // Checked after start so pi's default model and its thinking-level mapping are covered.
+      if (session.model?.startsWith(`${CODEX_PROVIDER}/`)) {
+        const plan = await this.codexPlan();
+        if (plan) assertAllowed(plan, session.model, session.thinking);
+      }
     } catch (error) {
       await session.kill();
       throw error;
     }
     this.sessions.set(session.id, session);
     return session;
+  }
+
+  // ponytail: read once per bridge process; a plan change needs a Claude Code restart.
+  // Without a Codex sign-in there is nothing to enforce: pi reports the auth error itself.
+  codexPlan() {
+    this.plan ??= codexPlan(this.command).catch(() => null);
+    return this.plan;
   }
 
   async assertReviewSkills() {
