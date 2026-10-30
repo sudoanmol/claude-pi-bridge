@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PiClient } from "./pi-client.mjs";
+import { createWorktree, install, installCommands, removeWorktree } from "./worktree.mjs";
 
 const MAX_ACTIVITY = 200;
 const RUN_WAIT_MS = 100_000;
@@ -34,7 +35,7 @@ export class Bridge {
     this.nextId = 1;
   }
 
-  async open({ session_id, cwd = process.cwd(), model, thinking, name } = {}, mode) {
+  async open({ session_id, cwd = process.cwd(), model, thinking, name, worktree = false } = {}, mode) {
     if (session_id) {
       const session = this.get(session_id);
       if (mode === "task" && session.mode !== "task") throw new Error(`Session ${session_id} is read-only; start a new pi_task session.`);
@@ -42,7 +43,8 @@ export class Bridge {
       return session;
     }
     if (mode === "review") await this.assertReviewSkills();
-    const session = new PiSession({ id: `p${this.nextId++}`, mode, cwd: path.resolve(cwd), name, command: this.command });
+    const tree = worktree ? await createWorktree(path.resolve(cwd), name) : null;
+    const session = new PiSession({ id: `p${this.nextId++}`, mode, cwd: tree?.path ?? path.resolve(cwd), name, worktree: tree, command: this.command });
     try {
       await session.start({ model, thinking });
     } catch (error) {
@@ -98,7 +100,13 @@ export class Bridge {
     const session = this.get(sessionId);
     await session.kill();
     this.sessions.delete(sessionId);
-    return { session_id: sessionId, killed: true, cost_usd: session.cost };
+    const result = { session_id: sessionId, killed: true, cost_usd: session.cost };
+    if (session.worktree) {
+      const removed = await removeWorktree(session.worktree);
+      result.worktree = { ...session.worktree, removed };
+      if (!removed) result.worktree.note = "Kept: the worktree has uncommitted or untracked changes.";
+    }
+    return result;
   }
 
   async models(search = "") {
@@ -125,8 +133,9 @@ export class Bridge {
 }
 
 class PiSession {
-  constructor({ id, mode, cwd, name, command }) {
+  constructor({ id, mode, cwd, name, worktree, command }) {
     this.id = id;
+    this.worktree = worktree;
     this.mode = mode;
     this.cwd = cwd;
     this.name = name ?? null;
@@ -145,7 +154,10 @@ class PiSession {
   }
 
   async start({ model, thinking }) {
-    const args = ["--append-system-prompt", INSTRUCTIONS[this.mode], "-e", ASK_CLAUDE, "--exclude-tools", EXCLUDED_TOOLS[this.mode]];
+    const instructions = this.worktree
+      ? `${INSTRUCTIONS[this.mode]} You work alone in a git worktree on branch ${this.worktree.branch}, created from ${this.worktree.base}; other workers have their own. Commit your changes to this branch when done. Do not push, rebase, or switch branches.`
+      : INSTRUCTIONS[this.mode];
+    const args = ["--append-system-prompt", instructions, "-e", ASK_CLAUDE, "--exclude-tools", EXCLUDED_TOOLS[this.mode]];
     if (model) args.push("--model", model);
     if (thinking) args.push("--thinking", thinking);
     if (this.name) args.push("--name", this.name);
@@ -169,6 +181,16 @@ class PiSession {
     if (thinking !== undefined && thinking !== this.requested.thinking && thinking !== this.thinking) throw new Error(`Session ${this.id} uses thinking "${this.thinking}". Start a new session to change it.`);
   }
 
+  // Runs in the background so pi_task with wait:false returns at once; the first prompt waits for it.
+  async installDependencies() {
+    for (const command of await installCommands(this.cwd)) {
+      const started = Date.now();
+      this.recordActivity({ kind: "setup", phase: "started", command: command.flat().join(" ") });
+      await install(this.cwd, command);
+      this.recordActivity({ kind: "setup", phase: "completed", command: command.flat().join(" "), duration_ms: Date.now() - started });
+    }
+  }
+
   async run(prompt, { wait = true } = {}) {
     if (this.failure) throw this.failure;
     if (this.active) throw new Error(`Session ${this.id} is still working; use pi_steer, pi_wait, or pi_kill.`);
@@ -179,13 +201,16 @@ class PiSession {
     this.lastAssistant = null;
     this.startedAt = Date.now();
     this.active = true;
-    try {
+    // Started here, after the activity reset, so the install steps show in this turn's activity.
+    if (this.worktree) this.setup ??= this.installDependencies();
+    const sent = (async () => {
+      await this.setup;
       const { disposition } = await this.client.request("prompt", { message: prompt });
       if (disposition === "handled") this.finish({ aborted: false });
-    } catch (error) {
-      this.active = false;
-      throw error;
-    }
+    })();
+    if (!this.setup) {
+      try { await sent; } catch (error) { this.active = false; throw error; }
+    } else sent.catch((error) => this.failTurn(error));
     return wait ? this.wait({ terminalOnly: true, timeoutMs: RUN_WAIT_MS }) : this.summary("started");
   }
 
@@ -274,6 +299,14 @@ class PiSession {
     this.recordActivity({ kind: "result", status });
   }
 
+  failTurn(error) {
+    if (!this.active) return;
+    this.result = { status: "failed", response: null, error: error.message, duration_ms: Date.now() - this.startedAt };
+    this.active = false;
+    this.running = null;
+    this.recordActivity({ kind: "result", status: "failed" });
+  }
+
   recordActivity(event, itemId = null) {
     const index = itemId ? this.activity.findIndex((entry) => entry.item_id === itemId) : -1;
     const previous = index >= 0 ? this.activity.splice(index, 1)[0] : {};
@@ -336,6 +369,7 @@ class PiSession {
       result: this.result,
       error: this.failure?.message ?? null,
       cost_usd: Number(this.cost.toFixed(4)),
+      worktree: this.worktree,
       activity_latest_seq: this.activitySeq,
       session_file: this.sessionFile
     };

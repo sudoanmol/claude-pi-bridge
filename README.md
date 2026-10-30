@@ -6,7 +6,7 @@ It is built for three jobs:
 
 - **Second opinions.** `pi_ask` puts a question, plan, or bug to pi in a read-only session.
 - **Reviews of Claude's work.** `pi_review` runs pi with the `review` and `deslop` skills on a scope Claude gives it, and returns findings for Claude to act on.
-- **Parallel workers.** `pi_task` starts any number of workspace-write sessions; one `pi_wait` supervises them all.
+- **Parallel workers.** `pi_task` with `worktree: true` starts each worker in its own git worktree; one `pi_wait` supervises them all.
 
 ## Install
 
@@ -34,12 +34,12 @@ Restart Claude Code after installing or updating, and start a new conversation: 
 | --- | --- |
 | `pi_ask` | Second opinion or repository question. Read-only. |
 | `pi_review` | Review Claude's work with the `review` and `deslop` skills. Read-only. Takes a `scope`. |
-| `pi_task` | Workspace-write task. Run several with `wait: false` for parallel workers. |
+| `pi_task` | Workspace-write task. Add `worktree: true` and `wait: false` for parallel workers. |
 | `pi_answer` | Answer a question pi asked (`question_id` such as `q1`). |
 | `pi_steer` | Send a correction to a working session. pi reads it after its current tool calls. |
 | `pi_wait` | Wait on one or more sessions; returns when any has a question, a result, a failure, or new activity. |
 | `pi_status` | Snapshot of one session, or of all sessions when `session_id` is omitted. |
-| `pi_kill` | Abort the running turn and stop the pi process so it spends no more tokens. |
+| `pi_kill` | Abort the running turn, stop the pi process so it spends no more tokens, and remove a clean worktree. |
 | `pi_models` | Search model names; returns pi's default model and the thinking levels. |
 
 `model` (`provider/id`, for example `deepseek/deepseek-flash`), `thinking`, `cwd`, and `name` apply when a session starts and stay fixed for it. pi maps a thinking level the model does not support to a nearby one, so every result reports the level in use. Results also report the session's cumulative `cost_usd` and pi's `session_file`, which `pi --session <path>` reopens.
@@ -58,7 +58,16 @@ Errors reach Claude as data. A model or provider error ends the turn with `statu
 
 ## Parallel workers
 
-Start each worker with `wait: false` and a `name`, then pass all of them to one `pi_wait`. Workers share `cwd` unless given their own, so give tasks that could touch the same files separate directories, such as git worktrees. Kill each session when its work is done.
+Start each worker with `pi_task`, `worktree: true`, `wait: false`, and a `name`, then pass all of them to one `pi_wait`. For each worker the bridge:
+
+1. Creates `<repo>/.pi-bridge/worktrees/<name>-<random>` on a new branch `pi-bridge/<name>-<random>` from `HEAD`. Uncommitted changes in the main tree are not included, so commit first if the workers need them.
+2. Adds `.pi-bridge/` to `.git/info/exclude`, so the main tree never shows the worktrees and `.gitignore` stays untouched.
+3. Copies the root `.env*` files that the worktree lacks.
+4. Installs dependencies from the root lockfile before sending the first prompt: `pnpm install --frozen-lockfile`, `bun install --frozen-lockfile`, `yarn install --frozen-lockfile`, or `npm ci` for JavaScript, and `uv sync --frozen` for Python. The install shows in the activity log as `setup` steps; a failed install fails the turn with the installer's output.
+
+pi is told to commit its work to its branch. Merge the branches you want, then `pi_kill` each session: it removes a worktree that has no uncommitted or untracked changes and always keeps the branch. A worktree with leftover changes stays, and the result says so.
+
+Without `worktree`, workers share `cwd`.
 
 ## How sessions are configured
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -187,4 +187,82 @@ test("models search filters names and reports the default", async () => {
   const models = await bridge.models("DEEP");
   assert.deepEqual(models.models, ["deepseek/deepseek-flash"]);
   assert.equal(models.default, "fake/default");
+});
+
+async function gitRepo() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-bridge-repo-"));
+  const run = (...args) => new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd: dir });
+    child.on("exit", (code) => (code ? reject(new Error(`git ${args.join(" ")} failed`)) : resolve()));
+  });
+  await run("init", "-q");
+  await writeFile(path.join(dir, ".gitignore"), ".env\n.env.local\nnode_modules/\n");
+  await writeFile(path.join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  await run("add", "-A");
+  await run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init");
+  await writeFile(path.join(dir, ".env"), "SECRET=1\n");
+  await writeFile(path.join(dir, ".env.local"), "LOCAL=1\n");
+  return dir;
+}
+
+// A pnpm stand-in on PATH: records its arguments, or fails when FAKE_PNPM_FAIL is set.
+async function fakePnpm() {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "pi-bridge-bin-"));
+  await writeFile(path.join(bin, "pnpm"), `#!/bin/sh\nif [ -n "$FAKE_PNPM_FAIL" ]; then echo "lockfile out of date" >&2; exit 1; fi\nmkdir -p node_modules && echo "$@" > node_modules/.installed\n`, { mode: 0o755 });
+  process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+}
+
+test("worktree sessions get their own branch, .env files, and installed dependencies", async () => {
+  await fakePnpm();
+  const repo = await gitRepo();
+  const bridge = new Bridge({ command });
+  try {
+    const a = await bridge.open({ cwd: repo, name: "API work", worktree: true }, "task");
+    const b = await bridge.open({ cwd: repo, name: "API work", worktree: true }, "task");
+    assert.notEqual(a.cwd, b.cwd);
+    assert.match(a.worktree.branch, /^pi-bridge\/api-work-[0-9a-f]{6}$/);
+    assert.ok(a.cwd.startsWith(path.join(await realpath(repo), ".pi-bridge", "worktrees")));
+
+    const done = await a.run("ARGS");
+    assert.equal(done.status, "completed");
+    const args = JSON.parse(done.result.response);
+    assert.match(args[args.indexOf("--append-system-prompt") + 1], new RegExp(`branch ${a.worktree.branch}`));
+    assert.equal(await readFile(path.join(a.cwd, ".env"), "utf8"), "SECRET=1\n");
+    assert.equal(await readFile(path.join(a.cwd, ".env.local"), "utf8"), "LOCAL=1\n");
+    assert.equal((await readFile(path.join(a.cwd, "node_modules", ".installed"), "utf8")).trim(), "install --frozen-lockfile");
+    assert.deepEqual(a.status().activity.filter((event) => event.kind === "setup").map((event) => event.phase), ["started", "completed"]);
+    assert.match(await readFile(path.join(repo, ".git", "info", "exclude"), "utf8"), /^\.pi-bridge\/$/m);
+
+    await writeFile(path.join(b.cwd, "scratch.txt"), "uncommitted");
+    const cleanKill = await bridge.kill(a.id);
+    const dirtyKill = await bridge.kill(b.id);
+    assert.equal(cleanKill.worktree.removed, true);
+    await assert.rejects(access(a.cwd));
+    assert.equal(dirtyKill.worktree.removed, false);
+    await access(b.cwd);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("a failed dependency install fails the turn with the installer's output", async () => {
+  await fakePnpm();
+  const repo = await gitRepo();
+  const bridge = new Bridge({ command });
+  process.env.FAKE_PNPM_FAIL = "1";
+  try {
+    const session = await bridge.open({ cwd: repo, worktree: true }, "task");
+    assert.equal((await session.run("hello", { wait: false })).status, "started");
+    const { sessions: [failed] } = await bridge.wait([{ session_id: session.id, since: 0 }]);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.result.error, /pnpm install --frozen-lockfile\nlockfile out of date/);
+  } finally {
+    delete process.env.FAKE_PNPM_FAIL;
+    await bridge.close();
+  }
+});
+
+test("worktree outside a git repository is a clear error", async () => {
+  const bridge = new Bridge({ command });
+  await assert.rejects(bridge.open({ cwd: os.tmpdir(), worktree: true }, "task"), /needs a git repository/);
 });

@@ -6,7 +6,7 @@ const bridge = new Bridge();
 
 const sessionProperties = {
   session_id: { type: "string", description: "Continue this session. Omit to start a new one." },
-  cwd: { type: "string", description: "Working directory for a new session. Give parallel task sessions separate directories (for example git worktrees) when their files could overlap." },
+  cwd: { type: "string", description: "Working directory for a new session; defaults to the bridge's working directory." },
   model: { type: "string", description: "provider/id for a new session, for example deepseek/deepseek-flash. Use pi_models to search. Defaults to pi's configured model." },
   thinking: { type: "string", enum: THINKING_LEVELS, description: "Thinking level for a new session. pi maps unsupported levels to a nearby one; the result reports the level in use." },
   name: { type: "string", description: "Label for a new session, shown in pi_status and pi's session list." },
@@ -27,8 +27,16 @@ const tools = [
   },
   {
     name: "pi_task",
-    description: `Give pi a task that changes the workspace. To run pi workers in parallel, start several sessions with wait:false and supervise them all with one pi_wait. ${answerNote}`,
-    inputSchema: { type: "object", properties: { prompt: { type: "string" }, ...sessionProperties }, required: ["prompt"] }
+    description: `Give pi a task that changes the workspace. To run pi workers in parallel, start each with worktree:true and wait:false, then supervise them all with one pi_wait. ${answerNote}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        ...sessionProperties,
+        worktree: { type: "boolean", description: "Run in a new git worktree under <repo>/.pi-bridge/worktrees on its own branch from HEAD (uncommitted changes are not included). Root .env files are copied and dependencies installed from the lockfile before pi starts the task. pi commits its work to the branch; merge it, then pi_kill removes the worktree when it is clean. Use for parallel workers." }
+      },
+      required: ["prompt"]
+    }
   },
   {
     name: "pi_answer",
@@ -83,7 +91,7 @@ const tools = [
   },
   {
     name: "pi_kill",
-    description: "Kill a session: abort its running turn and stop its pi process so it spends no more tokens. Kill sessions you no longer need, including finished ones.",
+    description: "Kill a session: abort its running turn and stop its pi process so it spends no more tokens. Kill sessions you no longer need, including finished ones. A worktree is removed only when it has no uncommitted or untracked changes; its branch is always kept.",
     inputSchema: { type: "object", properties: { session_id: { type: "string" } }, required: ["session_id"] }
   },
   {
