@@ -1,531 +1,401 @@
+import { access } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
-import { AppServerClient } from "./app-server-client.mjs";
+import { fileURLToPath } from "node:url";
+import { PiClient } from "./pi-client.mjs";
 
-const MAX_CLARIFICATIONS = 3;
 const MAX_ACTIVITY = 200;
-const WAIT_TIMEOUT_MS = 100_000;
+const RUN_WAIT_MS = 100_000;
 const WAIT_TOOL_TIMEOUT_MS = 90_000;
 // After the first new event, keep collecting so one wait returns a batch instead of a single event.
 const WAIT_BATCH_MS = 3_000;
-// Visible through `running`; recording them would wake waiters without anything to act on.
-const QUIET_STARTS = new Set(["reasoning", "agentMessage"]);
+const KILL_ABORT_MS = 2_000;
+const ASK_CLAUDE = fileURLToPath(new URL("../extensions/ask-claude.ts", import.meta.url));
+const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
+// Activity kinds that end a wait at once; anything else is batched.
+const URGENT = new Set(["question", "result", "failed"]);
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+const BASE_INSTRUCTIONS = "You are pi, working for Claude Code, which assigned this work and supervises it. Follow the repository's AGENTS.md. When a material requirement or repository fact is missing, call ask_claude instead of guessing; never ask the human directly. Your final message is all Claude sees, so make it self-contained.";
+const INSTRUCTIONS = {
+  ask: `${BASE_INSTRUCTIONS} This session is read-only: do not modify files, commit, or run commands that change state.`,
+  review: `${BASE_INSTRUCTIONS} This session is read-only: do not modify files, commit, or run commands that change state.`,
+  task: `${BASE_INSTRUCTIONS} Make the requested changes, run the relevant checks, and end with what changed and which checks ran.`
+};
+// pi has no sandbox; read-only sessions only lose the file-writing tools. The user's own
+// ask_user_question tool cannot reach anyone over RPC, so every session uses ask_claude instead.
+const EXCLUDED_TOOLS = { ask: "edit,write,ask_user_question", review: "edit,write,ask_user_question", task: "ask_user_question" };
 
 export class Bridge {
-  constructor({ appServerCommand } = {}) {
+  constructor({ command, skillsDir = path.join(os.homedir(), ".agents", "skills") } = {}) {
     this.sessions = new Map();
-    this.appServerCommand = appServerCommand;
+    this.command = command;
+    this.skillsDir = skillsDir;
+    this.nextId = 1;
   }
 
-  async session({ sessionId, cwd = process.cwd(), model, effort, mode = "ask" } = {}) {
-    if (sessionId && this.sessions.has(sessionId)) {
-      const existing = this.sessions.get(sessionId);
-      existing.assertConfig(model, effort);
-      return existing;
+  async open({ session_id, cwd = process.cwd(), model, thinking, name } = {}, mode) {
+    if (session_id) {
+      const session = this.get(session_id);
+      if (mode === "task" && session.mode !== "task") throw new Error(`Session ${session_id} is read-only; start a new pi_task session.`);
+      session.assertConfig(model, thinking);
+      return session;
     }
-    if (sessionId) throw new Error(`Unknown bridge session: ${sessionId}`);
-    sessionId = randomUUID();
-    const root = path.resolve(cwd);
-    const session = new CodexSession({ sessionId, cwd: root, model, effort, mode, appServerCommand: this.appServerCommand });
+    if (mode === "review") await this.assertReviewSkills();
+    const session = new PiSession({ id: `p${this.nextId++}`, mode, cwd: path.resolve(cwd), name, command: this.command });
     try {
-      await session.start();
+      await session.start({ model, thinking });
     } catch (error) {
-      await session.close();
+      await session.kill();
       throw error;
     }
-    this.sessions.set(sessionId, session);
+    this.sessions.set(session.id, session);
     return session;
+  }
+
+  async assertReviewSkills() {
+    for (const skill of ["review", "deslop"]) {
+      const file = path.join(this.skillsDir, skill, "SKILL.md");
+      try { await access(file); } catch { throw new Error(`pi_review needs the "${skill}" skill at ${file}`); }
+    }
+  }
+
+  reviewPrompt(scope) {
+    return [
+      `/skill:review Review Claude's work. Scope: ${scope}`,
+      "",
+      "This is a read-only review: report findings; do not edit files or remove tests.",
+      `Also apply the deslop skill (${path.join(this.skillsDir, "deslop", "SKILL.md")}) to the same scope and report the slop it finds as findings instead of removing it.`,
+      "Order findings by severity. Give each one file:line, the problem, and a concrete fix."
+    ].join("\n");
   }
 
   get(sessionId) {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Unknown bridge session: ${sessionId}`);
+    if (!session) throw new Error(`Unknown pi session: ${sessionId}`);
     return session;
   }
 
-  async closeSession(sessionId) {
+  status(sessionId, since) {
+    if (sessionId) return this.get(sessionId).status(since);
+    return { sessions: [...this.sessions.values()].map((session) => session.summary()) };
+  }
+
+  // Returns when any listed session needs attention, with every listed session's state.
+  async wait(entries, timeoutMs) {
+    if (!entries?.length) throw new Error("sessions must list at least one session");
+    const targets = entries.map(({ session_id, since }) => [this.get(session_id), since]);
+    // A finished session only ends the wait through new events, unless nothing is left running.
+    const wakeWhenIdle = targets.every(([session]) => !session.active);
+    const controller = new AbortController();
+    const waits = targets.map(([session, since]) => session.wait({ since, timeoutMs, wakeWhenIdle, signal: controller.signal }));
+    await Promise.race(waits);
+    controller.abort();
+    return { sessions: await Promise.all(waits) };
+  }
+
+  async kill(sessionId) {
     const session = this.get(sessionId);
-    await session.close();
+    await session.kill();
     this.sessions.delete(sessionId);
-    return { session_id: sessionId, closed: true };
+    return { session_id: sessionId, killed: true, cost_usd: session.cost };
+  }
+
+  async models(search = "") {
+    const client = new PiClient({ cwd: process.cwd(), args: ["--no-session"], command: this.command });
+    client.start();
+    try {
+      const [{ models = [] }, state] = await Promise.all([client.request("get_available_models"), client.request("get_state")]);
+      const needle = search.toLowerCase();
+      return {
+        default: modelName(state.model),
+        models: models.map(modelName).filter((name) => name.toLowerCase().includes(needle)),
+        thinking_levels: THINKING_LEVELS,
+        note: "pi maps a thinking level the model does not support to a nearby one; each result reports the level in use."
+      };
+    } finally {
+      await client.close();
+    }
   }
 
   async close() {
-    await Promise.all([...this.sessions.values()].map((session) => session.close()));
+    await Promise.all([...this.sessions.values()].map((session) => session.kill()));
     this.sessions.clear();
   }
 }
 
-class CodexSession {
-  constructor({ sessionId, cwd, model, effort, mode, appServerCommand }) {
-    this.sessionId = sessionId;
-    this.cwd = cwd;
-    this.model = model;
-    this.effort = effort;
+class PiSession {
+  constructor({ id, mode, cwd, name, command }) {
+    this.id = id;
     this.mode = mode;
-    this.appServerCommand = appServerCommand;
-    this.clarifications = 0;
-    this.pendingQuestion = null;
-    this.active = null;
+    this.cwd = cwd;
+    this.name = name ?? null;
+    this.command = command;
     this.activity = [];
     this.activitySeq = 0;
     this.activityEvictedThrough = 0;
-    this.lastResult = null;
+    this.questions = new Map();
+    this.nextQuestion = 1;
     this.waiters = new Set();
+    this.active = false;
     this.running = null;
+    this.result = null;
+    this.failure = null;
+    this.cost = 0;
   }
 
-  async start() {
-    this.client = new AppServerClient({
+  async start({ model, thinking }) {
+    const args = ["--append-system-prompt", INSTRUCTIONS[this.mode], "-e", ASK_CLAUDE, "--exclude-tools", EXCLUDED_TOOLS[this.mode]];
+    if (model) args.push("--model", model);
+    if (thinking) args.push("--thinking", thinking);
+    if (this.name) args.push("--name", this.name);
+    this.client = new PiClient({
       cwd: this.cwd,
-      onServerRequest: (message, client) => this.handleServerRequest(message, client),
-      onNotification: (message) => this.handleNotification(message),
-      onFailure: (error) => this.handleFailure(error),
-      command: this.appServerCommand
+      args,
+      command: this.command,
+      onEvent: (event) => this.handleEvent(event),
+      onFailure: (error) => this.handleFailure(error)
     });
-    await this.client.start();
-    this.modelCatalog = await this.loadModels();
-    const defaultModel = this.modelCatalog.find((entry) => entry.isDefault);
-    const selectedModel = this.model
-      ? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model)
-      : defaultModel;
-    if (this.model && !selectedModel) throw new Error(`Unknown Codex model: ${this.model}. Use codex_models to list available models.`);
-    this.model = selectedModel?.model ?? selectedModel?.id ?? null;
-    this.effort ??= selectedModel?.defaultReasoningEffort ?? null;
-    this.validateModelOptions(this.model, this.effort);
-    const developerInstructions = [
-      "You are Codex working as a peer to Claude Code.",
-      "Work only inside the supplied repository and follow its AGENTS.md instructions.",
-      "When a material requirement or repository fact is missing, use request_user_input to ask Claude for clarification instead of guessing.",
-      "Keep clarification questions short and actionable. Do not ask the human directly."
-    ].join(" ");
-    this.collaborationMode = this.mode === "task" ? "default" : "plan";
-    this.collaborationSettings = {
-      model: this.model,
-      reasoning_effort: this.effort,
-      developer_instructions: developerInstructions
-    };
-    const thread = await this.client.request("thread/start", {
-      cwd: this.cwd,
-      model: this.model ?? null,
-      ephemeral: false,
-      approvalPolicy: "never",
-      sandbox: this.mode === "task" ? "workspace-write" : "read-only",
-      developerInstructions,
-      collaborationMode: { mode: this.collaborationMode, settings: this.collaborationSettings },
-      threadSource: "cli"
-    });
-    this.threadId = thread.thread?.id;
-    if (!this.threadId) throw new Error("Codex did not return a thread id");
+    this.client.start();
+    const state = await this.client.request("get_state");
+    this.model = modelName(state.model);
+    this.thinking = state.thinkingLevel ?? null;
+    this.sessionFile = state.sessionFile ?? null;
+    this.requested = { model, thinking };
   }
 
-  async ask(prompt, options = {}) {
-    return this.run(prompt, options);
+  assertConfig(model, thinking) {
+    if (model !== undefined && model !== this.requested.model && model !== this.model) throw new Error(`Session ${this.id} uses model "${this.model}". Start a new session to change model.`);
+    if (thinking !== undefined && thinking !== this.requested.thinking && thinking !== this.thinking) throw new Error(`Session ${this.id} uses thinking "${this.thinking}". Start a new session to change it.`);
   }
 
-  async review({ prompt = "Review the current repository changes and report concrete findings.", base, ...options } = {}) {
-    const target = base ? `Review the changes from ${base} to HEAD.` : "Review the current uncommitted changes, including untracked files.";
-    return this.run(`${target}\n${prompt}\nDo not modify files. Ask Claude for clarification when needed.`, options);
-  }
-
-  async task(prompt, options = {}) {
-    if (this.mode !== "task") throw new Error("codex_task requires a task session");
-    return this.run(`${prompt}\nMake the requested changes in the repository, then report what changed and any checks you ran. Ask Claude for clarification when needed.`, options);
-  }
-
-  async run(prompt, { model, effort, include_commentary = false, wait = true } = {}) {
-    if (this.active?.result) this.active = null;
-    if (this.active) throw new Error("This Codex session already has an active turn");
-    this.assertConfig(model, effort);
-    this.clarifications = 0;
-    this.output = "";
-    this.messages = new Map();
+  async run(prompt, { wait = true } = {}) {
+    if (this.failure) throw this.failure;
+    if (this.active) throw new Error(`Session ${this.id} is still working; use pi_steer, pi_wait, or pi_kill.`);
     this.activity = [];
     this.activityEvictedThrough = this.activitySeq;
-    this.lastResult = null;
-    this.pendingQuestion = null;
+    this.result = null;
     this.running = null;
-    this.active = { turnId: null, includeCommentary: include_commentary, startedAt: Date.now() };
+    this.lastAssistant = null;
+    this.startedAt = Date.now();
+    this.active = true;
     try {
-      const started = await this.client.request("turn/start", {
-        threadId: this.threadId,
-        input: [{ type: "text", text: prompt }],
-        model: this.model,
-        effort: this.effort,
-        cwd: this.cwd,
-        sandboxPolicy: this.mode === "task" ? { type: "workspaceWrite", writableRoots: [this.cwd] } : { type: "readOnly" },
-        collaborationMode: { mode: this.collaborationMode, settings: this.collaborationSettings }
-      });
-      this.active.turnId = started.turn?.id ?? null;
-      if (!wait) return this.envelope({ status: "started", turn: this.summarizeTurn(started.turn ?? { id: this.active.turnId, status: "inProgress" }) });
-      const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
-      if (result.status !== "question" && result.status !== "running") this.active = null;
-      return this.envelope(result);
+      const { disposition } = await this.client.request("prompt", { message: prompt });
+      if (disposition === "handled") this.finish({ aborted: false });
     } catch (error) {
-      this.active = null;
+      this.active = false;
       throw error;
     }
+    return wait ? this.wait({ terminalOnly: true, timeoutMs: RUN_WAIT_MS }) : this.summary("started");
   }
 
-  async answer(questionId, answer) {
-    const question = this.pendingQuestion;
-    if (!question || !question.questions.some((entry) => entry.id === questionId)) throw new Error(`Unknown question: ${questionId}`);
-    if (question.kind === "async") return this.answerAsyncQuestion(question, questionId, answer);
-    question.answers[questionId] = { answers: [answer] };
-    const next = question.questions.find((entry) => !question.answers[entry.id]);
-    if (next) {
-      question.id = next.id;
-      question.question = next;
-      return this.envelope({ status: "question", question });
-    }
-    this.pendingQuestion = null;
-    this.active.pause = null;
-    const completion = this.waitForActiveTurn(WAIT_TIMEOUT_MS);
-    this.client.respond(question.rpcId, {
-      answers: question.answers
-    });
-    const result = await completion;
-    if (result.status !== "question" && result.status !== "running") this.active = null;
-    return this.envelope(result);
+  async answer(questionId, answer, { wait = true } = {}) {
+    const pending = this.questions.get(questionId);
+    if (!pending) throw new Error(`Unknown question ${questionId} in session ${this.id}`);
+    const { method, options } = pending.question;
+    if (method === "select" && !options.includes(answer)) throw new Error(`Answer must be one of: ${options.join(", ")}`);
+    this.questions.delete(questionId);
+    const reply = method === "confirm" ? { confirmed: /^(y|yes|true|ok|confirm)/i.test(answer.trim()) } : { value: answer };
+    this.client.send({ type: "extension_ui_response", id: pending.rpcId, ...reply });
+    return wait ? this.wait({ terminalOnly: true, timeoutMs: RUN_WAIT_MS }) : this.summary();
   }
 
-  async answerAsyncQuestion(question, questionId, answer) {
-    question.answers[questionId] = answer;
-    const next = question.questions.find((entry) => !question.answers[entry.id]);
-    if (next) {
-      question.id = next.id;
-      question.question = next;
-      return this.envelope({ status: "question", question });
-    }
-    const active = this.active;
-    if (!active?.turnId || active.result) throw new Error("The Codex turn is no longer active; start a new turn.");
-    active.pause = null;
-    const answerText = Object.entries(question.answers).map(([id, value]) => `${id}: ${value}`).join("\n");
-    await this.client.request("turn/steer", {
-      threadId: this.threadId,
-      expectedTurnId: active.turnId,
-      input: [{ type: "text", text: answerText }]
-    });
-    this.pendingQuestion = null;
-    const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
-    if (result.status !== "question" && result.status !== "running") this.active = null;
-    return this.envelope(result);
+  async steer(message, { wait = true } = {}) {
+    if (!this.active) throw new Error(`Session ${this.id} is not working; send a new prompt instead.`);
+    await this.client.request("steer", { message });
+    return wait ? this.wait({ terminalOnly: true, timeoutMs: RUN_WAIT_MS }) : this.summary();
   }
 
-  async steer(message) {
-    if (!this.active?.turnId) throw new Error("No active Codex turn to steer");
-    if (this.active.result) throw new Error("The Codex turn has already completed");
-    await this.client.request("turn/steer", {
-      threadId: this.threadId,
-      expectedTurnId: this.active.turnId,
-      input: [{ type: "text", text: message }]
-    });
-    const result = await this.waitForActiveTurn(WAIT_TIMEOUT_MS);
-    if (result.status !== "question" && result.status !== "running") this.active = null;
-    return this.envelope(result);
+  handleEvent(event) {
+    switch (event.type) {
+      case "extension_ui_request":
+        if (DIALOGS.has(event.method)) this.ask(event);
+        return;
+      case "message_start":
+        if (event.message?.role === "assistant") this.running = { kind: "model", started_at: Date.now() };
+        return;
+      case "message_end":
+        return this.handleAssistant(event.message);
+      case "tool_execution_start": {
+        const item = describeTool(event);
+        this.running = { ...item, started_at: Date.now() };
+        return this.recordActivity({ phase: "started", ...item }, event.toolCallId);
+      }
+      case "tool_execution_update":
+        if (event.toolName === "bash") this.recordActivity({ output_tail: shortTail(textOf(event.partialResult)) }, event.toolCallId);
+        return;
+      case "tool_execution_end":
+        if (this.running?.item_id === event.toolCallId) this.running = null;
+        return this.recordActivity({ phase: "completed", is_error: Boolean(event.isError), duration_ms: event.durationMs ?? null }, event.toolCallId);
+      case "auto_retry_start":
+        return this.recordActivity({ kind: "retry", attempt: event.attempt, text: shortText(event.errorMessage) });
+      case "auto_retry_end":
+        if (!event.success) this.recordActivity({ kind: "error", text: shortText(event.finalError) });
+        return;
+      case "compaction_end":
+        if (event.errorMessage) this.recordActivity({ kind: "error", text: shortText(`Compaction failed: ${event.errorMessage}`) });
+        return;
+      case "extension_error":
+        return this.recordActivity({ kind: "error", text: shortText(`Extension ${path.basename(event.extensionPath ?? "")} failed in ${event.event}: ${event.error}`) });
+      case "agent_settled":
+        return this.finish(event);
+    }
   }
 
-  waitForActiveTurn(timeoutMs = null) {
-    if (!this.active) throw new Error("No active Codex turn");
-    if (this.active.result) {
-      const result = this.active.result;
-      this.active.result = null;
-      return Promise.resolve(result);
-    }
-    if (this.active.pause) {
-      const result = this.active.pause;
-      this.active.pause = null;
-      return Promise.resolve(result);
-    }
-    return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject };
-      this.active.resume = waiter;
-      if (timeoutMs === null) return;
-      waiter.timer = setTimeout(() => {
-        if (this.active?.resume !== waiter) return;
-        this.active.resume = null;
-        resolve({ status: "running", turn: this.summarizeTurn({ id: this.active.turnId, status: "inProgress" }) });
-      }, timeoutMs);
-    });
-  }
-
-  handleServerRequest(message, client) {
-    if (message.method !== "item/tool/requestUserInput") {
-      client.respondError(message.id, { code: -32601, message: `Unsupported Codex request: ${message.method}` });
-      return;
-    }
-    const questions = message.params?.questions ?? [];
-    if (this.clarifications >= MAX_CLARIFICATIONS) {
-      client.respond(message.id, { answers: Object.fromEntries(questions.map((q) => [q.id, { answers: ["Proceed with the safest reasonable assumption and state it explicitly."] }])) });
-      return;
-    }
-    this.clarifications += 1;
-    const question = questions[0];
-    if (!question) return client.respond(message.id, { answers: {} });
-    this.pendingQuestion = { id: question.id, rpcId: message.id, question, questions, answers: {}, sessionId: this.sessionId };
-    const active = this.active;
-    const result = { status: "question", question: this.pendingQuestion };
-    if (active?.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
-    else if (active) { active.pause = result; }
-    this.notifyWaiters();
-  }
-
-  handleNotification(message) {
-    if (message.method === "item/started") return this.handleItemStarted(message.params);
-    if (message.method === "item/completed") return this.handleItemCompleted(message.params);
-    if (message.method === "turn/plan/updated") return this.recordActivity({ kind: "plan", text: this.shortText(message.params?.explanation ?? message.params?.plan?.map((step) => step.step ?? step).join("; ")) });
-    if (message.method === "item/agentMessage/delta") {
-      const itemId = message.params?.itemId ?? "default";
-      const delta = message.params?.delta ?? "";
-      this.messages.set(itemId, `${this.messages.get(itemId) ?? ""}${delta}`);
-      this.output += delta;
-    }
-    if (message.method === "item/commandExecution/outputDelta") {
-      this.appendActivity(message.params?.itemId, "output_tail", message.params?.delta);
-      return;
-    }
-    if (message.method === "item/mcpToolCall/progress") {
-      this.appendActivity(message.params?.itemId, "progress_tail", message.params?.message);
-      return;
-    }
-    if (message.method !== "turn/completed") return;
-    const active = this.active;
-    if (!active) return;
-    const turn = message.params?.turn ?? null;
-    const agentMessage = turn?.items?.find((item) => item.type === "agentMessage");
-    const asyncQuestions = agentMessage?.questions ?? [];
-    if (asyncQuestions.length && this.pendingQuestion?.item_id !== agentMessage?.id) return this.publishAsyncQuestion(asyncQuestions, active, agentMessage?.id, turn);
-    const final = agentMessage?.phase === "final_answer" ? agentMessage.text : turn?.items?.find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
-    const response = active.includeCommentary ? [...this.messages.values()].join("\n") : final ?? this.output;
-    const result = { status: turn?.status ?? "completed", response, turn: this.summarizeTurn(turn) };
-    this.lastResult = result;
+  handleAssistant(message) {
+    if (message?.role !== "assistant") return;
     this.running = null;
-    if (active.resume) { clearTimeout(active.resume.timer); active.resume.resolve(result); active.resume = null; }
-    else active.result = result;
-    this.notifyWaiters();
+    this.lastAssistant = message;
+    this.cost += message.usage?.cost?.total ?? 0;
+    const text = textOf(message);
+    if (text) this.recordActivity({ kind: "message", text: shortText(text) });
   }
 
-  handleItemStarted(params = {}) {
-    const item = this.describeItem(params.item);
-    if (item.source_type === "userMessage") return;
-    this.running = { ...item, started_at: params.startedAtMs ?? Date.now() };
-    if (QUIET_STARTS.has(item.source_type)) return;
-    this.recordActivity({ phase: "started", ...item }, item.item_id);
+  ask(request) {
+    const id = `q${this.nextQuestion++}`;
+    const question = { id, method: request.method, title: request.title };
+    if (request.message) question.message = request.message;
+    if (request.options) question.options = request.options;
+    if (request.placeholder) question.hint = request.placeholder;
+    this.questions.set(id, { rpcId: request.id, question });
+    this.recordActivity({ kind: "question", question_id: id, text: shortText(request.title) });
+    // pi resolves a timed dialog on its own; drop the question so Claude does not answer a stale one.
+    if (request.timeout) setTimeout(() => { this.questions.delete(id); this.notifyWaiters(); }, request.timeout).unref();
   }
 
-  handleItemCompleted(params = {}) {
-    const item = this.describeItem(params.item);
-    if (this.running?.item_id === item.item_id) this.running = null;
-    if (item.source_type === "agentMessage" && params.item?.questions?.length && this.active) {
-      if (this.pendingQuestion?.item_id !== item.item_id) this.publishAsyncQuestion(params.item.questions, this.active, item.item_id);
-    }
-    if (item.source_type !== "userMessage" && item.source_type !== "reasoning") this.recordActivity({ phase: "completed", ...item }, item.item_id);
-  }
-
-  publishAsyncQuestion(rawQuestions, active, itemId = null, turn = null) {
-    const questions = this.normalizeQuestions(rawQuestions);
-    const pendingQuestion = {
-      kind: "async",
-      id: questions[0].id,
-      question: questions[0],
-      questions,
-      answers: {},
-      includeCommentary: active.includeCommentary,
-      item_id: itemId,
-      sessionId: this.sessionId
-    };
-    this.pendingQuestion = pendingQuestion;
-    const result = {
-      status: "question",
-      question: pendingQuestion,
-      response: null,
-      turn: this.summarizeTurn(turn ?? { id: active.turnId, status: "inProgress" })
-    };
-    if (active.resume) {
-      clearTimeout(active.resume.timer);
-      active.resume.resolve(result);
-      active.resume = null;
-    } else if (!active.result) active.pause = result;
-    this.notifyWaiters();
-  }
-
-  normalizeQuestions(rawQuestions = []) {
-    const used = new Set();
-    return rawQuestions.map((question, index) => {
-      const base = question.id ? String(question.id) : `q${index + 1}`;
-      let id = base;
-      let suffix = 2;
-      while (used.has(id)) id = `${base}_${suffix++}`;
-      used.add(id);
-      return {
-        id,
-        title: question.title ?? question.question ?? "Clarification",
-        options: question.options ?? []
-      };
-    });
-  }
-
-  describeItem(item = {}) {
-    const base = { item_id: item.id ?? null, source_type: item.type ?? "unknown" };
-    if (item.type === "commandExecution") return { ...base, kind: "command", command: this.shortText(item.command, 240), ...(item.cwd && path.resolve(item.cwd) !== this.cwd ? { cwd: item.cwd } : {}), status: item.status ?? null, exit_code: item.exitCode ?? null };
-    if (item.type === "fileChange") return { ...base, kind: "file_change", status: item.status ?? null, files: (item.changes ?? []).map((change) => change.path).filter(Boolean) };
-    if (item.type === "mcpToolCall") return { ...base, kind: "mcp_tool", server: item.server ?? null, tool: item.tool ?? null, status: item.status ?? null };
-    if (item.type === "agentMessage") return { ...base, kind: "message", text: this.shortText(this.messages.get(item.id) ?? item.text) };
-    if (item.type === "plan") return { ...base, kind: "plan", text: this.shortText(item.text) };
-    return base;
-  }
-
-  shortText(value, limit = 200) {
-    if (!value) return null;
-    const text = String(value).replace(/\s+/g, " ").trim();
-    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  finish({ aborted }) {
+    const message = this.lastAssistant;
+    const status = aborted ? "aborted" : message?.stopReason === "error" ? "failed" : "completed";
+    this.result = { status, response: (message && textOf(message)) || null, duration_ms: Date.now() - this.startedAt };
+    if (status === "failed") this.result.error = message.errorMessage ?? "pi reported an error";
+    this.active = false;
+    this.running = null;
+    this.questions.clear();
+    this.recordActivity({ kind: "result", status });
   }
 
   recordActivity(event, itemId = null) {
     const index = itemId ? this.activity.findIndex((entry) => entry.item_id === itemId) : -1;
     const previous = index >= 0 ? this.activity.splice(index, 1)[0] : {};
-    const entry = { ...previous, ...event, seq: ++this.activitySeq, at: Date.now() };
-    this.activity.push(entry);
-    if (this.activity.length > MAX_ACTIVITY) {
-      this.activityEvictedThrough = this.activity.shift().seq;
-    }
+    this.activity.push({ ...previous, ...event, seq: ++this.activitySeq, at: Date.now() });
+    if (this.activity.length > MAX_ACTIVITY) this.activityEvictedThrough = this.activity.shift().seq;
     this.notifyWaiters();
   }
 
-  appendActivity(itemId, field, value) {
-    if (!itemId || !value) return;
-    const entry = this.activity.find((event) => event.item_id === itemId);
-    const tail = `${entry?.[field] ?? ""}${value}`.slice(-240);
-    this.recordActivity({ item_id: itemId, [field]: tail }, itemId);
-  }
-
-  wait(since = this.activitySeq, timeoutMs = WAIT_TOOL_TIMEOUT_MS) {
+  wait({ since = this.activitySeq, timeoutMs = WAIT_TOOL_TIMEOUT_MS, terminalOnly = false, wakeWhenIdle = true, signal } = {}) {
     if (!Number.isSafeInteger(since) || since < 0) throw new Error("since must be a non-negative integer");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error("timeout_ms must be a non-negative integer");
-    if (this.failure) return Promise.reject(this.failure);
-    const snapshot = this.status(since);
-    const reason = this.waitReason(snapshot);
-    if (reason) return Promise.resolve({ ...snapshot, status: reason });
-    return new Promise((resolve, reject) => {
-      const waiter = { since, resolve, reject, timer: null, batchTimer: null };
-      waiter.timer = setTimeout(() => this.settleWaiter(waiter), Math.min(timeoutMs, WAIT_TOOL_TIMEOUT_MS));
+    return new Promise((resolve) => {
+      const waiter = { since, terminalOnly, wakeWhenIdle, resolve, batchTimer: null };
+      waiter.timer = setTimeout(() => this.settleWaiter(waiter), Math.min(timeoutMs, terminalOnly ? RUN_WAIT_MS : WAIT_TOOL_TIMEOUT_MS));
+      signal?.addEventListener("abort", () => this.settleWaiter(waiter), { once: true });
       this.waiters.add(waiter);
+      this.checkWaiter(waiter);
     });
   }
 
-  settleWaiter(waiter) {
-    this.waiters.delete(waiter);
-    clearTimeout(waiter.timer);
-    clearTimeout(waiter.batchTimer);
-    const snapshot = this.status(waiter.since);
-    waiter.resolve({ ...snapshot, status: this.waitReason(snapshot) ?? "running" });
+  checkWaiter(waiter) {
+    if (waiter.terminalOnly) {
+      if (this.failure || this.questions.size || !this.active) this.settleWaiter(waiter);
+      return;
+    }
+    const fresh = this.activity.filter((event) => event.seq > waiter.since);
+    if (fresh.some((event) => URGENT.has(event.kind)) || (!this.active && waiter.wakeWhenIdle)) this.settleWaiter(waiter);
+    else if (fresh.length) waiter.batchTimer ??= setTimeout(() => this.settleWaiter(waiter), WAIT_BATCH_MS);
   }
 
-  waitReason(snapshot) {
-    if (snapshot.pending_question) return "question";
-    if (snapshot.result) return snapshot.result.status ?? "completed";
-    if (!snapshot.active) return "idle";
-    if (snapshot.activity.length) return "updated";
-    return null;
+  settleWaiter(waiter) {
+    if (!this.waiters.delete(waiter)) return;
+    clearTimeout(waiter.timer);
+    clearTimeout(waiter.batchTimer);
+    const reason = this.waitReason(waiter.since) ?? "running";
+    waiter.resolve(waiter.terminalOnly ? this.summary(reason === "updated" ? "running" : reason) : this.status(waiter.since, reason));
   }
 
   notifyWaiters() {
-    for (const waiter of this.waiters) {
-      const reason = this.waitReason(this.status(waiter.since));
-      if (!reason) continue;
-      if (reason !== "updated") this.settleWaiter(waiter);
-      else waiter.batchTimer ??= setTimeout(() => this.settleWaiter(waiter), WAIT_BATCH_MS);
-    }
+    for (const waiter of this.waiters) this.checkWaiter(waiter);
   }
 
-  summarizeTurn(turn) {
-    if (!turn) return null;
+  waitReason(since) {
+    if (this.failure) return "failed";
+    if (this.questions.size) return "question";
+    if (!this.active) return this.result?.status ?? "idle";
+    if (this.activity.at(-1)?.seq > since) return "updated";
+    return null;
+  }
+
+  summary(status) {
     return {
-      id: turn.id,
-      status: turn.status,
-      error: turn.error ?? null,
-      startedAt: turn.startedAt ?? null,
-      completedAt: turn.completedAt ?? null,
-      durationMs: turn.durationMs ?? null,
-      item_ids: (turn.items ?? []).map((item) => item.id).filter(Boolean)
+      session_id: this.id,
+      name: this.name,
+      mode: this.mode,
+      model: this.model,
+      thinking: this.thinking,
+      status: status ?? this.waitReason(this.activitySeq) ?? "running",
+      pending_questions: [...this.questions.values()].map(({ question }) => question),
+      result: this.result,
+      error: this.failure?.message ?? null,
+      cost_usd: Number(this.cost.toFixed(4)),
+      activity_latest_seq: this.activitySeq,
+      session_file: this.sessionFile
+    };
+  }
+
+  status(since = 0, reason) {
+    return {
+      ...this.summary(reason),
+      cwd: this.cwd,
+      elapsed_ms: this.active ? Date.now() - this.startedAt : null,
+      running: this.running ? { ...this.running, elapsed_ms: Date.now() - this.running.started_at } : null,
+      activity: this.activity.filter((event) => event.seq > since),
+      activity_truncated: since < this.activityEvictedThrough
     };
   }
 
   handleFailure(error) {
+    if (this.failure) return;
     this.failure = error;
-    const active = this.active;
-    this.pendingQuestion = null;
-    this.active = null;
-    for (const waiter of this.waiters) {
-      clearTimeout(waiter.timer);
-      clearTimeout(waiter.batchTimer);
-      waiter.reject(error);
-    }
-    this.waiters.clear();
-    if (active?.resume) { clearTimeout(active.resume.timer); active.resume.reject(error); }
+    this.active = false;
+    this.running = null;
+    this.questions.clear();
+    this.recordActivity({ kind: "failed", text: shortText(error.message) });
   }
 
-  async loadModels() {
-    try {
-      const result = await this.client.request("model/list", { includeHidden: false });
-      return result.data ?? [];
-    } catch {
-      return [];
-    }
-  }
-
-  validateModelOptions(model, effort) {
-    if (!model && !effort) return;
-    const selected = model ? this.modelCatalog.find((entry) => entry.id === model || entry.model === model) : null;
-    if (model && !selected) throw new Error(`Unknown Codex model: ${model}. Use codex_models to list available models.`);
-    if (!effort) return;
-    const target = selected ?? this.modelCatalog.find((entry) => entry.id === this.model || entry.model === this.model || entry.isDefault);
-    const efforts = target?.supportedReasoningEfforts?.map((entry) => entry.reasoningEffort) ?? [];
-    if (efforts.length && !efforts.includes(effort)) throw new Error(`Unsupported reasoning effort "${effort}" for ${model ?? this.model}; supported: ${efforts.join(", ")}`);
-  }
-
-  assertConfig(model, effort) {
-    if (model !== undefined && model !== this.model) throw new Error(`This session uses model "${this.model}". Start a new session to change model.`);
-    if (effort !== undefined && effort !== this.effort) throw new Error(`This session uses reasoning effort "${this.effort}". Start a new session to change effort.`);
-  }
-
-  envelope(result) {
-    return { ...result, session_id: this.sessionId, model: this.model, effort: this.effort };
-  }
-
-  status(since = 0) {
-    return {
-      session_id: this.sessionId,
-      thread_id: this.threadId,
-      cwd: this.cwd,
-      mode: this.mode,
-      model: this.model,
-      effort: this.effort,
-      active: Boolean(this.active && !this.active.result),
-      turn_id: this.active?.turnId ?? null,
-      elapsed_ms: this.active?.startedAt ? Date.now() - this.active.startedAt : null,
-      running: this.running ? { ...this.running, elapsed_ms: Math.max(0, Date.now() - this.running.started_at) } : null,
-      activity: this.activity.filter((event) => event.seq > since),
-      activity_latest_seq: this.activitySeq,
-      activity_truncated: since < this.activityEvictedThrough,
-      pending_question: this.pendingQuestion,
-      result: this.active?.result ?? this.lastResult
-    };
-  }
-
-  models(verbose = false) {
-    if (verbose) return this.modelCatalog ?? [];
-    return (this.modelCatalog ?? []).map((entry) => ({
-      id: entry.model ?? entry.id,
-      displayName: entry.displayName,
-      isDefault: entry.isDefault,
-      defaultReasoningEffort: entry.defaultReasoningEffort,
-      supportedReasoningEfforts: (entry.supportedReasoningEfforts ?? []).map((effort) => effort.reasoningEffort)
-    }));
-  }
-
-  async close() {
-    this.handleFailure(new Error("Codex session closed"));
+  async kill() {
+    // Abort first so the provider stops generating; closing alone could let the run finish.
+    if (this.active && !this.failure) await Promise.race([this.client.request("abort").catch(() => {}), delay(KILL_ABORT_MS)]);
+    this.handleFailure(new Error(`Session ${this.id} was killed`));
     await this.client?.close();
   }
+}
+
+function describeTool({ toolCallId, toolName, args = {} }) {
+  const base = { item_id: toolCallId, tool: toolName };
+  if (toolName === "bash") return { ...base, kind: "command", command: shortText(args.command, 240) };
+  if (toolName === "edit" || toolName === "write") return { ...base, kind: "file_change", path: args.path ?? null };
+  return { ...base, kind: "tool", ...(args.path ? { path: args.path } : args.pattern ? { pattern: shortText(args.pattern) } : {}) };
+}
+
+function textOf(value) {
+  const content = value?.content;
+  if (typeof content === "string") return content;
+  return (content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
+}
+
+function shortText(value, limit = 200) {
+  if (!value) return null;
+  const text = String(value).replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function shortTail(value, limit = 240) {
+  return value ? value.slice(-limit) : null;
+}
+
+function modelName(model) {
+  return model ? `${model.provider}/${model.id}` : null;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

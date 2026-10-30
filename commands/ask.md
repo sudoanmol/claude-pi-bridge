@@ -1,9 +1,9 @@
 ---
-description: Ask Codex a repository question
+description: Get a second opinion from pi, or ask it a repository question
 argument-hint: "<question>"
-allowed-tools: mcp__codex__codex_ask, mcp__codex__codex_answer, mcp__codex__codex_wait, mcp__codex__codex_status
+allowed-tools: mcp__plugin_pi-bridge_pi__pi_ask, mcp__plugin_pi-bridge_pi__pi_answer, mcp__plugin_pi-bridge_pi__pi_wait, mcp__plugin_pi-bridge_pi__pi_status, mcp__plugin_pi-bridge_pi__pi_kill
 ---
 
-Call `codex_ask` with the user's question and return Codex's response.
-If Codex returns a clarification question, answer it from the current Claude context with `codex_answer`, then return the continued response.
-For a long question, pass `wait: false`, then use `codex_wait` with the latest `activity_latest_seq` until Codex finishes.
+Call `pi_ask` with the user's question and return pi's response.
+If pi asks a clarification question, answer it from the current context with `pi_answer`, then return the continued response.
+If the result is `failed`, report pi's error as given. Kill the session with `pi_kill` when no follow-up is expected.

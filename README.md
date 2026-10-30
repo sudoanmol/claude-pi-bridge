@@ -1,78 +1,83 @@
-# Claude ↔ Codex Bridge
+# Claude ↔ pi Bridge
 
-This Claude Code plugin gives Claude a local MCP channel to Codex CLI. It uses the Codex app-server, so each bridge session keeps a real Codex thread and supports feedback in both directions.
+This Claude Code plugin gives Claude a local MCP channel to [pi](https://github.com/earendil-works/pi). Each bridge session runs one `pi --mode rpc` process and keeps one pi conversation, so Claude and pi can talk in both directions: pi asks Claude questions, and Claude steers pi while it works.
 
-## Install the plugin
+It is built for three jobs:
 
-From Claude Code, load this directory as a local plugin:
+- **Second opinions.** `pi_ask` puts a question, plan, or bug to pi in a read-only session.
+- **Reviews of Claude's work.** `pi_review` runs pi with the `review` and `deslop` skills on a scope Claude gives it, and returns findings for Claude to act on.
+- **Parallel workers.** `pi_task` starts any number of workspace-write sessions; one `pi_wait` supervises them all.
 
-```text
-/Users/anmolhurkat/Developer/claude-codex-bridge
-```
+## Install
 
-The plugin starts `src/mcp-server.mjs` over stdio, as declared in `.claude-plugin/plugin.json`. The repository has no root `.mcp.json`, so opening it as a project does not start a second, unconfigured server. The bridge uses the `codex` executable on `PATH`. Set `CODEX_BIN` when Codex lives elsewhere.
-
-Codex must be installed and authenticated before you use the tools:
+pi must be installed and signed in to at least one provider:
 
 ```sh
-codex --version
+pi --version
+pi --list-models deepseek
 ```
 
-To install it permanently through the local marketplace, run these commands inside Claude Code:
+The bridge runs the `pi` executable on `PATH`. Set `PI_BIN` when pi lives elsewhere. `pi_review` also needs `~/.agents/skills/review/SKILL.md` and `~/.agents/skills/deslop/SKILL.md`; it fails with the missing path when either is absent.
+
+Install the plugin through the local marketplace from inside Claude Code:
 
 ```text
 /plugin marketplace add /Users/anmolhurkat/Developer/claude-codex-bridge
-/plugin install codex-bridge@local
+/plugin install pi-bridge@local
 ```
 
-Restart Claude Code after installation. The marketplace manifest is `.claude-plugin/marketplace.json`.
+Restart Claude Code after installing or updating, and start a new conversation: a resumed conversation keeps the MCP tool definitions it already loaded.
 
-## Claude-facing tools
+## Tools
 
-- `codex_ask` starts a read-only Codex conversation for repository questions.
-- `codex_task` starts a workspace-write Codex conversation for an implementation task.
-- `codex_review` starts a read-only review of uncommitted changes or a base revision.
-- `codex_models` lists available models and each model's supported reasoning efforts.
-- `codex_steer` sends feedback while a Codex turn is active.
-- `codex_wait` waits for new activity, a clarification, or completion without sending Codex a message.
-- `codex_answer` answers a question that Codex sends back.
-- `codex_status` shows the thread, progress, model, effort, and any pending question.
-- `codex_close` closes a session and its local app-server process.
+| Tool | Purpose |
+| --- | --- |
+| `pi_ask` | Second opinion or repository question. Read-only. |
+| `pi_review` | Review Claude's work with the `review` and `deslop` skills. Read-only. Takes a `scope`. |
+| `pi_task` | Workspace-write task. Run several with `wait: false` for parallel workers. |
+| `pi_answer` | Answer a question pi asked (`question_id` such as `q1`). |
+| `pi_steer` | Send a correction to a working session. pi reads it after its current tool calls. |
+| `pi_wait` | Wait on one or more sessions; returns when any has a question, a result, a failure, or new activity. |
+| `pi_status` | Snapshot of one session, or of all sessions when `session_id` is omitted. |
+| `pi_kill` | Abort the running turn and stop the pi process so it spends no more tokens. |
+| `pi_models` | Search model names; returns pi's default model and the thinking levels. |
 
-Pass `model` and `effort` only when starting a session. The bridge validates them against `model/list`; for example, use `model: "gpt-6-astra"` and an effort returned by `codex_models`. A session keeps that configuration for every turn.
+`model` (`provider/id`, for example `deepseek/deepseek-flash`), `thinking`, `cwd`, and `name` apply when a session starts and stay fixed for it. pi maps a thinking level the model does not support to a nearby one, so every result reports the level in use. Results also report the session's cumulative `cost_usd` and pi's `session_file`, which `pi --session <path>` reopens.
 
 ## The conversation loop
 
-1. Claude calls `codex_ask`, `codex_task`, or `codex_review` and keeps the returned `session_id`.
-2. Codex can return `status: "question"` when it needs repository context.
-3. Claude answers with `codex_answer` and the same `session_id` and `question_id`.
-4. Claude can send corrections or review feedback with `codex_steer` while Codex is working.
-5. Codex returns `status: "completed"` with its response and turn metadata.
+1. Claude calls `pi_ask`, `pi_review`, or `pi_task` and keeps the returned `session_id` (`p1`, `p2`, …).
+2. pi can call its `ask_claude` tool. The result then has `status: "question"` and `pending_questions`; Claude answers with `pi_answer`.
+3. With `wait: true` (the default) a call returns at a question or the result, or with `status: "running"` after 100 seconds.
+4. With `wait: false` the call returns once pi accepts the prompt. Claude then calls `pi_wait`, passing each session's last `activity_latest_seq` as `since`, and steers, answers, or kills from what the activity shows.
+5. Passing `session_id` to `pi_ask`, `pi_review`, or `pi_task` sends a follow-up into the same conversation. A read-only session cannot take a `pi_task`.
 
-Set `wait: false` to return after Codex starts a turn. Call `codex_wait` with the last `activity_latest_seq` as `since` to wait for new commands, file changes, tool calls, questions, or completion. Use `codex_status` for an immediate snapshot, and use `codex_steer` or `codex_answer` when the activity needs a correction.
+`pi_wait` batches activity for 3 seconds after the first new event, so one call returns several steps. Questions, results, and failures return immediately. A session whose result Claude has already seen does not wake the wait again; when every listed session has finished, the wait returns at once. The wait is capped at 90 seconds.
 
-`wait: true` returns a question or completion as soon as one arrives and is capped at 100 seconds. A longer turn returns `status: "running"` with its `session_id`; continue with `codex_status`, `codex_steer`, or `codex_answer`.
+Errors reach Claude as data. A model or provider error ends the turn with `status: "failed"` and `result.error`. A pi process that exits reports `status: "failed"` with pi's stderr. Retries, failed compaction, and extension errors appear in the activity log.
 
-`codex_wait` is capped at 90 seconds. Pass the last `activity_latest_seq` as `since`; updated activity items receive a new sequence number. After the first new event it keeps collecting for 3 seconds, so one call returns a batch. Questions and completion return immediately. Reasoning steps never wake a wait; they show only in `running`. Restart Claude Code after installing a new plugin version so it reloads the MCP tool definitions.
+## Parallel workers
 
-The same loop applies to reviews. Review prompts run as normal persistent turns so they can be clarified and steered; the native one-shot review endpoint is not used.
+Start each worker with `wait: false` and a `name`, then pass all of them to one `pi_wait`. Workers share `cwd` unless given their own, so give tasks that could touch the same files separate directories, such as git worktrees. Kill each session when its work is done.
 
-Read-only ask and review sessions use Codex's `plan` collaboration mode because that mode exposes structured clarification requests. Workspace-write tasks use Codex's normal collaboration mode.
+## How sessions are configured
+
+- Every session loads `extensions/ask-claude.ts`, which adds the `ask_claude` tool, and appends instructions telling pi it works for Claude.
+- pi has no sandbox. Read-only sessions run without the `edit` and `write` tools and are told not to change state, but `bash` remains available.
+- The `ask_user_question` tool from a pi package cannot reach anyone over RPC, so the bridge removes it in favor of `ask_claude`.
+- Other extensions, skills, and settings load as they would in a terminal `pi` session. Their dialogs (`select`, `confirm`, `input`, `editor`) also reach Claude as questions.
+- Sessions are saved like normal pi sessions.
 
 ## Claude Code shortcuts
 
-- `/codex-ask <question>` delegates a repository question.
-- `/codex-task <task>` delegates a workspace-write implementation task.
-- `/codex-review [focus]` starts an interactive review.
+- `/pi-bridge:ask <question>` asks for a second opinion.
+- `/pi-bridge:review [scope]` reviews Claude's recent work.
+- `/pi-bridge:task <task>` splits work across parallel pi workers.
 
 ## Development
 
 ```sh
-npm test
+pnpm test
 ```
 
-The tests include a fake app-server round trip for a Codex clarification. A live smoke test requires an authenticated Codex CLI.
-
-## Deliberate limits
-
-The bridge keeps one active turn per session. It forwards Codex clarification requests and uses `approvalPolicy: "never"` for workspace-write tasks inside the selected working directory. Use a separate Codex session when a task needs a different sandbox or model configuration.
+The tests drive the bridge against `test/fake-pi.mjs`, a stand-in that speaks pi's RPC protocol. A live check needs an authenticated pi.

@@ -2,11 +2,11 @@
   "name": "local",
   "owner": { "name": "Anmol Hurkat" },
   "metadata": {
-    "description": "A local Claude Code bridge to Codex CLI with reviews, tasks, steering, and clarification exchange."
+    "description": "A local Claude Code bridge to pi with second opinions, reviews, parallel workers, steering, and clarification exchange."
   },
   "plugins": [
     {
-      "name": "codex-bridge",
+      "name": "pi-bridge",
       "source": "./"
     }
   ]

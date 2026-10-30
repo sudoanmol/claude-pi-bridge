@@ -1,13 +1,13 @@
 {
-  "name": "claude-codex-bridge",
-  "version": "0.1.0",
+  "name": "claude-pi-bridge",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "bin": {
-    "claude-codex-bridge": "src/mcp-server.mjs"
+    "claude-pi-bridge": "src/mcp-server.mjs"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=18.18"

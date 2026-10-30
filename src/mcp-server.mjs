@@ -1,193 +1,141 @@
 #!/usr/bin/env node
-import readline from "node:readline";
-import { Bridge } from "./bridge.mjs";
+import { Bridge, THINKING_LEVELS } from "./bridge.mjs";
+import { readLines } from "./pi-client.mjs";
 
 const bridge = new Bridge();
 
+const sessionProperties = {
+  session_id: { type: "string", description: "Continue this session. Omit to start a new one." },
+  cwd: { type: "string", description: "Working directory for a new session. Give parallel task sessions separate directories (for example git worktrees) when their files could overlap." },
+  model: { type: "string", description: "provider/id for a new session, for example deepseek/deepseek-flash. Use pi_models to search. Defaults to pi's configured model." },
+  thinking: { type: "string", enum: THINKING_LEVELS, description: "Thinking level for a new session. pi maps unsupported levels to a nearby one; the result reports the level in use." },
+  name: { type: "string", description: "Label for a new session, shown in pi_status and pi's session list." },
+  wait: { type: "boolean", description: "Wait up to 100 seconds for a question or completion (default true). Set false to start the turn and supervise with pi_wait, for example when running sessions in parallel." }
+};
+const answerNote = "pi can ask Claude a clarification question: the result then has status \"question\" and pending_questions; answer with pi_answer. Errors from pi or its model come back as status \"failed\" with error.";
+
 const tools = [
   {
-    name: "codex_ask",
-    description: "Ask Codex a repository question. Codex may pause and return a clarification question for Claude to answer with codex_answer.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string" },
-        session_id: { type: "string" },
-        cwd: { type: "string" },
-        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
-      },
-      required: ["prompt"]
-    }
+    name: "pi_ask",
+    description: `Get a second opinion from pi, or ask it a repository question. The session is read-only: pi has no edit or write tools and is told not to change state. ${answerNote}`,
+    inputSchema: { type: "object", properties: { prompt: { type: "string" }, ...sessionProperties }, required: ["prompt"] }
   },
   {
-    name: "codex_task",
-    description: "Ask Codex to make repository changes. Codex can pause for clarification before continuing.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string" },
-        session_id: { type: "string" },
-        cwd: { type: "string" },
-        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
-      },
-      required: ["prompt"]
-    }
+    name: "pi_review",
+    description: `Have pi review Claude's work with the review and deslop skills from ~/.agents/skills; fails if either skill is missing. Read-only: pi reports findings and Claude decides what to apply. Pass the scope: files, a diff range such as main...HEAD, or a description of the change. ${answerNote}`,
+    inputSchema: { type: "object", properties: { scope: { type: "string", description: "What to review." }, ...sessionProperties }, required: ["scope"] }
   },
   {
-    name: "codex_review",
-    description: "Run an interactive read-only Codex review. Codex can ask Claude clarification questions before returning findings.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string" },
-        base: { type: "string" },
-        session_id: { type: "string" },
-        cwd: { type: "string" },
-        model: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        effort: { type: "string", description: "Set only when starting a new session. Use codex_models for valid values." },
-        include_commentary: { type: "boolean", description: "Include streamed commentary as well as the final answer." },
-        wait: { type: "boolean", description: "Wait for a question or completion, up to 100 seconds. Set false to poll, steer, or answer while Codex works." }
-      }
-    }
+    name: "pi_task",
+    description: `Give pi a task that changes the workspace. To run pi workers in parallel, start several sessions with wait:false and supervise them all with one pi_wait. ${answerNote}`,
+    inputSchema: { type: "object", properties: { prompt: { type: "string" }, ...sessionProperties }, required: ["prompt"] }
   },
   {
-    name: "codex_answer",
-    description: "Answer a clarification question Codex asked during the current session; async questions are steered into the active turn.",
+    name: "pi_answer",
+    description: "Answer a question pi asked. For a select question, answer with one of its options; for confirm, answer yes or no.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string" },
-        question_id: { type: "string", description: "Use the question.id returned by codex_ask or codex_status (for example, q1)." },
-        answer: { type: "string" }
+        question_id: { type: "string", description: "The id from pending_questions, for example q1." },
+        answer: { type: "string" },
+        wait: sessionProperties.wait
       },
       required: ["session_id", "question_id", "answer"]
     }
   },
   {
-    name: "codex_steer",
-    description: "Send feedback or a correction to an active Codex turn.",
+    name: "pi_steer",
+    description: "Send a correction to a working session. pi reads it after its current tool calls, before its next model call.",
     inputSchema: {
       type: "object",
-      properties: { session_id: { type: "string" }, message: { type: "string" } },
+      properties: { session_id: { type: "string" }, message: { type: "string" }, wait: sessionProperties.wait },
       required: ["session_id", "message"]
     }
   },
   {
-    name: "codex_models",
-    description: "List Codex models and the reasoning efforts each model supports.",
-    inputSchema: {
-      type: "object",
-      properties: { session_id: { type: "string" }, cwd: { type: "string" }, verbose: { type: "boolean" } }
-    }
-  },
-  {
-    name: "codex_close",
-    description: "Close a Codex session and its local app-server process.",
-    inputSchema: {
-      type: "object",
-      properties: { session_id: { type: "string" } },
-      required: ["session_id"]
-    }
-  },
-  {
-    name: "codex_wait",
-    description: "Wait for new Codex activity, a clarification question, or completion without sending instructions. Activity is batched for a few seconds after the first new event; questions and completion return immediately. Reasoning steps appear only in running. After wait:false, call repeatedly with the last activity_latest_seq as since.",
+    name: "pi_wait",
+    description: "Wait on one or more sessions without sending anything. Returns when any of them asks a question, finishes, fails, or shows new activity (batched for 3 seconds after the first event), with the state of every listed session. Pass each session's last activity_latest_seq as since.",
     inputSchema: {
       type: "object",
       properties: {
-        session_id: { type: "string" },
-        since: { type: "integer", minimum: 0, description: "Last activity_latest_seq received; use 0 for the first wait. Updated items get new sequence numbers." },
-        timeout_ms: { type: "integer", minimum: 0, maximum: 90000, default: 90000, description: "Maximum wait in milliseconds. Returns running at timeout; capped at 90 seconds." }
+        sessions: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: { session_id: { type: "string" }, since: { type: "integer", minimum: 0, description: "Last activity_latest_seq seen; 0 at first." } },
+            required: ["session_id", "since"]
+          }
+        },
+        timeout_ms: { type: "integer", minimum: 0, maximum: 90000, default: 90000, description: "Maximum wait; capped at 90 seconds." }
       },
-      required: ["session_id", "since"]
+      required: ["sessions"]
     }
   },
   {
-    name: "codex_status",
-    description: "Read Codex progress immediately. Pass the last activity_latest_seq as since for only new or updated items. Prefer codex_wait between updates to avoid busy polling.",
+    name: "pi_status",
+    description: "Read a session's progress now: activity after since, the running step, questions, result, errors, and cost. Without session_id, list every open session. Prefer pi_wait to repeated polling.",
     inputSchema: {
       type: "object",
-      properties: { session_id: { type: "string" }, since: { type: "integer", minimum: 0, description: "Return activity events after this sequence number." } },
-      required: ["session_id"]
+      properties: { session_id: { type: "string" }, since: { type: "integer", minimum: 0, description: "Return activity after this sequence number." } }
+    }
+  },
+  {
+    name: "pi_kill",
+    description: "Kill a session: abort its running turn and stop its pi process so it spends no more tokens. Kill sessions you no longer need, including finished ones.",
+    inputSchema: { type: "object", properties: { session_id: { type: "string" } }, required: ["session_id"] }
+  },
+  {
+    name: "pi_models",
+    description: "Search the models pi can use. Returns provider/id names, pi's default model, and the thinking levels.",
+    inputSchema: {
+      type: "object",
+      properties: { search: { type: "string", description: "Case-insensitive substring, for example deepseek or sonnet. An empty string lists every model (hundreds)." } },
+      required: ["search"]
     }
   }
 ];
 
 async function callTool(name, args = {}) {
-  if (name === "codex_ask") {
-    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session(args);
-    return session.ask(args.prompt, args);
-  }
-  if (name === "codex_task") {
-    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ ...args, mode: "task" });
-    return session.task(args.prompt, args);
-  }
-  if (name === "codex_review") {
-    const session = args.session_id ? bridge.get(args.session_id) : await bridge.session({ ...args, mode: "review" });
-    return session.review(args);
-  }
-  if (name === "codex_answer") return bridge.get(args.session_id).answer(args.question_id, args.answer);
-  if (name === "codex_steer") return bridge.get(args.session_id).steer(args.message);
-  if (name === "codex_models") {
-    if (args.session_id) {
-      const session = bridge.get(args.session_id);
-      return { session_id: session.sessionId, models: session.models(args.verbose === true) };
-    }
-    const session = await bridge.session({ cwd: args.cwd });
-    try {
-      return { models: session.models(args.verbose === true) };
-    } finally {
-      await bridge.closeSession(session.sessionId);
-    }
-  }
-  if (name === "codex_close") return bridge.closeSession(args.session_id);
-  if (name === "codex_wait") return bridge.get(args.session_id).wait(args.since, args.timeout_ms);
-  if (name === "codex_status") return bridge.get(args.session_id).status(args.since ?? 0);
+  const wait = args.wait !== false;
+  if (name === "pi_ask") return (await bridge.open(args, "ask")).run(args.prompt, { wait });
+  if (name === "pi_review") return (await bridge.open(args, "review")).run(bridge.reviewPrompt(args.scope), { wait });
+  if (name === "pi_task") return (await bridge.open(args, "task")).run(args.prompt, { wait });
+  if (name === "pi_answer") return bridge.get(args.session_id).answer(args.question_id, args.answer, { wait });
+  if (name === "pi_steer") return bridge.get(args.session_id).steer(args.message, { wait });
+  if (name === "pi_wait") return bridge.wait(args.sessions, args.timeout_ms);
+  if (name === "pi_status") return bridge.status(args.session_id, args.since ?? 0);
+  if (name === "pi_kill") return bridge.kill(args.session_id);
+  if (name === "pi_models") return bridge.models(args.search);
   throw new Error(`Unknown tool: ${name}`);
 }
 
-function result(id, value) {
-  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] } };
-}
+const write = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 
-function error(id, message) {
-  return { jsonrpc: "2.0", id, error: { code: -32000, message } };
-}
-
-const input = readline.createInterface({ input: process.stdin });
-input.on("line", async (line) => {
-  if (!line.trim()) return;
+readLines(process.stdin, async (line) => {
   let message;
   try { message = JSON.parse(line); } catch { return; }
-  if (message.method === "notifications/initialized") return;
+  if (message.id === undefined) return;
   if (message.method === "initialize") {
-    return process.stdout.write(`${JSON.stringify({
-      jsonrpc: "2.0",
+    return write({
       id: message.id,
-      result: {
-        protocolVersion: "2025-06-18",
-        capabilities: { tools: {} },
-        serverInfo: { name: "claude-codex-bridge", version: "0.1.0" }
-      }
-    })}\n`);
+      result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "claude-pi-bridge", version: "0.2.0" } }
+    });
   }
   try {
-    if (message.method === "tools/list") return process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools } })}\n`);
+    if (message.method === "tools/list") return write({ id: message.id, result: { tools } });
     if (message.method === "tools/call") {
       const value = await callTool(message.params?.name, message.params?.arguments);
-      return process.stdout.write(`${JSON.stringify(result(message.id, value))}\n`);
+      return write({ id: message.id, result: { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] } });
     }
-    process.stdout.write(`${JSON.stringify(error(message.id, `Unknown method: ${message.method}`))}\n`);
+    write({ id: message.id, error: { code: -32601, message: `Unknown method: ${message.method}` } });
   } catch (err) {
-    process.stdout.write(`${JSON.stringify(error(message.id, err.message))}\n`);
+    write({ id: message.id, result: { content: [{ type: "text", text: err.message }], isError: true } });
   }
 });
 
-process.on("SIGINT", async () => { await bridge.close(); process.exit(0); });
-process.on("SIGTERM", async () => { await bridge.close(); process.exit(0); });
+const shutdown = async () => { await bridge.close(); process.exit(0); };
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.stdin.on("end", shutdown);

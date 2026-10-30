@@ -1,10 +1,10 @@
 {
-  "name": "codex-bridge",
-  "version": "0.1.0",
-  "description": "Bidirectional Claude Code and Codex app-server bridge",
+  "name": "pi-bridge",
+  "version": "0.2.0",
+  "description": "Bidirectional Claude Code bridge to pi: second opinions, reviews of Claude's work, and parallel pi workers",
   "author": { "name": "Anmol Hurkat" },
   "mcpServers": {
-    "codex": {
+    "pi": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/src/mcp-server.mjs"]
     }
