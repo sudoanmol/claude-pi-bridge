@@ -1,8 +1,8 @@
 {
-  "name": "local",
+  "name": "claude-pi-bridge",
   "owner": { "name": "Anmol Hurkat" },
   "metadata": {
-    "description": "A local Claude Code bridge to pi with second opinions, reviews, parallel workers, steering, and clarification exchange."
+    "description": "A Claude Code bridge to pi with second opinions, reviews, parallel workers, steering, and clarification exchange."
   },
   "plugins": [
     {

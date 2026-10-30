@@ -19,12 +19,14 @@ pi --list-models deepseek
 
 The bridge runs the `pi` executable on `PATH`. Set `PI_BIN` when pi lives elsewhere. `pi_review` also needs `~/.agents/skills/review/SKILL.md` and `~/.agents/skills/deslop/SKILL.md`; it fails with the missing path when either is absent.
 
-Install the plugin through the local marketplace from inside Claude Code:
+Install the plugin from inside Claude Code:
 
 ```text
-/plugin marketplace add /Users/anmolhurkat/Developer/claude-codex-bridge
-/plugin install pi-bridge@local
+/plugin marketplace add sudoanmol/claude-pi-bridge
+/plugin install pi-bridge@claude-pi-bridge
 ```
+
+For a local checkout, pass its path to `/plugin marketplace add` instead.
 
 Restart Claude Code after installing or updating, and start a new conversation: a resumed conversation keeps the MCP tool definitions it already loaded.
 
